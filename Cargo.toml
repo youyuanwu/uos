@@ -2,16 +2,16 @@
 resolver = "2"
 
 members = [
-    "tools/mkimage",
-    "_examples_embassy",
-    "crates/e1000",
-    "crates/hal-x86",
+    "tools/embclox-mkimage",
+    "examples",
+    "crates/embclox-e1000",
+    "crates/embclox-hal-x86",
 ]
 
 default-members = [
-    "tools/mkimage",
-    "crates/e1000",
-    "crates/hal-x86",
+    "tools/embclox-mkimage",
+    "crates/embclox-e1000",
+    "crates/embclox-hal-x86",
 ]
 
 [workspace.dependencies]
@@ -26,8 +26,8 @@ embassy-futures = "0.1"
 embedded-io-async = "0.7"
 
 # Drivers & platform
-e1000 = { path = "crates/e1000" }
-hal-x86 = { path = "crates/hal-x86" }
+embclox-e1000 = { path = "crates/embclox-e1000" }
+embclox-hal-x86 = { path = "crates/embclox-hal-x86" }
 bootloader = "0.11"
 bootloader_api = "0.11"
 x86_64 = "0.15"

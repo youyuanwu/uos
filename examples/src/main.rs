@@ -3,7 +3,7 @@
 #![feature(abi_x86_interrupt)]
 
 extern crate alloc;
-extern crate hal_x86;
+extern crate embclox_hal_x86;
 
 mod dma_alloc;
 mod e1000_adapter;
@@ -15,9 +15,9 @@ use core::sync::atomic::AtomicUsize;
 use dma_alloc::BootDmaAllocator;
 use e1000_adapter::E1000Embassy;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
+use embclox_hal_x86::apic::LocalApic;
+use embclox_hal_x86::ioapic::IoApic;
 use embedded_io_async::Write;
-use hal_x86::apic::LocalApic;
-use hal_x86::ioapic::IoApic;
 use log::*;
 use mmio_regs::MmioRegs;
 use static_cell::StaticCell;
@@ -46,7 +46,7 @@ fn lapic() -> &'static LocalApic {
 }
 
 extern "x86-interrupt" fn apic_timer_handler(_frame: InterruptStackFrame) {
-    hal_x86::time::on_timer_tick();
+    embclox_hal_x86::time::on_timer_tick();
     lapic().end_of_interrupt();
 }
 
@@ -68,26 +68,28 @@ extern "x86-interrupt" fn e1000_handler(_frame: InterruptStackFrame) {
 extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    let mut p = hal_x86::init(boot_info, hal_x86::Config::default());
-    info!("Booting e1000-embassy example...");
+    let mut p = embclox_hal_x86::init(boot_info, embclox_hal_x86::Config::default());
+    info!("Booting embclox example...");
 
     // --- Interrupt infrastructure ---
-    hal_x86::idt::init();
-    hal_x86::pic::disable();
+    embclox_hal_x86::idt::init();
+    embclox_hal_x86::pic::disable();
 
     // Map LAPIC
-    let lapic_vaddr = p.memory.map_mmio(hal_x86::apic::LAPIC_PHYS_BASE, 0x1000);
+    let lapic_vaddr = p
+        .memory
+        .map_mmio(embclox_hal_x86::apic::LAPIC_PHYS_BASE, 0x1000);
     let mut lapic_dev = LocalApic::new(lapic_vaddr);
     lapic_dev.enable();
 
     // Calibrate TSC via PIT
-    let tsc_per_us = hal_x86::pit::calibrate_tsc_mhz();
-    hal_x86::time::set_tsc_per_us(tsc_per_us);
+    let tsc_per_us = embclox_hal_x86::pit::calibrate_tsc_mhz();
+    embclox_hal_x86::time::set_tsc_per_us(tsc_per_us);
 
     // Register handlers
     unsafe {
-        hal_x86::idt::set_handler(32, apic_timer_handler);
-        hal_x86::idt::set_handler(39, spurious_handler);
+        embclox_hal_x86::idt::set_handler(32, apic_timer_handler);
+        embclox_hal_x86::idt::set_handler(39, spurious_handler);
     }
 
     // Start APIC timer: periodic, ~1ms intervals
@@ -99,7 +101,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unsafe { *core::ptr::addr_of_mut!(LAPIC) = Some(lapic_dev) };
 
     // Map IOAPIC
-    let ioapic_vaddr = p.memory.map_mmio(hal_x86::ioapic::IOAPIC_PHYS_BASE, 0x1000);
+    let ioapic_vaddr = p
+        .memory
+        .map_mmio(embclox_hal_x86::ioapic::IOAPIC_PHYS_BASE, 0x1000);
     let mut ioapic = IoApic::new(ioapic_vaddr);
     ioapic.log_info();
 
@@ -125,7 +129,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel_offset: p.memory.kernel_offset(),
         phys_offset: p.memory.phys_offset(),
     };
-    let mut e1000_device = e1000::E1000Device::new(regs, dma);
+    let mut e1000_device = embclox_e1000::E1000Device::new(regs, dma);
     info!("e1000 driver initialized");
 
     let mac = e1000_device.mac_address();
@@ -155,7 +159,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     info!("e1000 PCI IRQ line: {}", e1000_irq);
 
     // Register e1000 handler and route via IOAPIC
-    unsafe { hal_x86::idt::set_handler(33, e1000_handler) };
+    unsafe { embclox_hal_x86::idt::set_handler(33, e1000_handler) };
     ioapic.enable_irq(e1000_irq, 33, 0);
 
     // Enable e1000 device interrupts
@@ -199,8 +203,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 }
 
 fn e1000_reset(regs: &MmioRegs) {
-    use e1000::RegisterAccess;
-    use e1000::regs::*;
+    use embclox_e1000::RegisterAccess;
+    use embclox_e1000::regs::*;
 
     regs.write_reg(IMS, 0);
     let ctl = regs.read_reg(CTL);

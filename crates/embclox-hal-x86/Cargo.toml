@@ -1,5 +1,5 @@
 [package]
-name = "hal-x86"
+name = "embclox-hal-x86"
 version = "0.1.0"
 edition = "2021"
 

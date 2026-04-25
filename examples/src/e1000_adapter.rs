@@ -6,7 +6,7 @@ use embassy_sync::waitqueue::AtomicWaker;
 use crate::dma_alloc::BootDmaAllocator;
 use crate::mmio_regs::MmioRegs;
 
-type Dev = e1000::E1000Device<MmioRegs, BootDmaAllocator>;
+type Dev = embclox_e1000::E1000Device<MmioRegs, BootDmaAllocator>;
 
 /// Waker for the network runner task — signaled from the e1000 ISR.
 pub static NET_WAKER: AtomicWaker = AtomicWaker::new();

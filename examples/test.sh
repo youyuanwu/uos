@@ -1,5 +1,5 @@
 #!/bin/bash
-# test.sh — Run the e1000-embassy example on QEMU and verify TCP echo.
+# test.sh — Run the embclox example on QEMU and verify TCP echo.
 #
 # Usage: ./test.sh [--release]
 # Requires: qemu-system-x86_64, nc (netcat)
@@ -17,9 +17,9 @@ fi
 HOST_PORT=5555
 GUEST_PORT=1234
 TIMEOUT=30
-TEST_STRING="hello-embassy-e1000"
+TEST_STRING="hello-embclox"
 
-IMAGE="$SCRIPT_DIR/../target/x86_64-unknown-none/${MODE}/e1000-embassy-example.img"
+IMAGE="$SCRIPT_DIR/../target/x86_64-unknown-none/${MODE}/embclox-example.img"
 
 if [[ ! -f "$IMAGE" ]]; then
     echo "ERROR: disk image not found at $IMAGE"
@@ -35,7 +35,7 @@ qemu-system-x86_64 \
     -drive format=raw,file="$IMAGE" \
     -netdev user,id=net0,hostfwd=tcp::${HOST_PORT}-:${GUEST_PORT} \
     -device e1000,netdev=net0 \
-    > /tmp/qemu-e1000-test.log 2>&1 &
+    > /tmp/qemu-embclox-test.log 2>&1 &
 QEMU_PID=$!
 
 cleanup() {
@@ -50,7 +50,7 @@ sleep 8
 # Check QEMU is still running
 if ! kill -0 "$QEMU_PID" 2>/dev/null; then
     echo "ERROR: QEMU exited early. Log:"
-    cat /tmp/qemu-e1000-test.log
+    cat /tmp/qemu-embclox-test.log
     exit 1
 fi
 
@@ -63,6 +63,6 @@ if [[ "$RESPONSE" == "$TEST_STRING" ]]; then
 else
     echo "=== FAIL: expected '$TEST_STRING', got '$RESPONSE' ==="
     echo "QEMU log:"
-    cat /tmp/qemu-e1000-test.log
+    cat /tmp/qemu-embclox-test.log
     exit 1
 fi

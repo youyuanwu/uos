@@ -48,7 +48,7 @@ pub struct Peripherals {
 /// `kernel_offset` and `phys_offset` are computed from `BootInfo`.
 pub fn init(boot_info: &'static mut BootInfo, config: Config) -> Peripherals {
     if INITIALIZED.swap(true, Ordering::SeqCst) {
-        panic!("hal_x86::init() called more than once");
+        panic!("embclox_hal_x86::init() called more than once");
     }
 
     let serial = serial::Serial::new(config.serial_port);

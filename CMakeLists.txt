@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
-project(uos NONE)
+project(embclox NONE)
 
 set(ARCH "x86_64" CACHE STRING "Target architecture")
 set(TARGET "${ARCH}-unknown-none")
 set(MODE "debug" CACHE STRING "Build mode: debug or release")
-set(KERNEL_REL "target/${TARGET}/${MODE}/e1000-embassy-example")
+set(KERNEL_REL "target/${TARGET}/${MODE}/embclox-example")
 set(IMAGE_REL "${KERNEL_REL}.img")
 
 set(BUILD_ARGS "")
@@ -15,7 +15,7 @@ endif()
 add_custom_target(check
     COMMAND cargo fmt --all
     COMMAND cargo clippy -- -D warnings
-    COMMAND cargo clippy --manifest-path _examples_embassy/Cargo.toml
+    COMMAND cargo clippy --manifest-path examples/Cargo.toml
         --target ${TARGET} -- -D warnings
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Formatting and linting all crates"
@@ -23,12 +23,12 @@ add_custom_target(check
 
 add_custom_target(example-build
     COMMAND cargo build ${BUILD_ARGS}
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/_examples_embassy
-    COMMENT "Building e1000-embassy example (${MODE})"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/examples
+    COMMENT "Building embclox example (${MODE})"
 )
 
 add_custom_target(image
-    COMMAND cargo run -p mkimage -- ${KERNEL_REL} ${IMAGE_REL}
+    COMMAND cargo run -p embclox-mkimage -- ${KERNEL_REL} ${IMAGE_REL}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     DEPENDS example-build
     COMMENT "Creating BIOS disk image"
@@ -49,7 +49,7 @@ add_custom_target(qemu
 
 add_custom_target(test
     COMMAND bash test.sh
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/_examples_embassy
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/examples
     DEPENDS image
     COMMENT "Running QEMU integration test"
 )

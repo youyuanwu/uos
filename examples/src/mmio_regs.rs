@@ -1,4 +1,4 @@
-use e1000::RegisterAccess;
+use embclox_e1000::RegisterAccess;
 
 /// MMIO register access via UC-mapped volatile pointer.
 #[derive(Clone, Copy)]
