@@ -2,30 +2,23 @@
 
 ## Overview
 
-The `crates/e1000` crate is a clean e1000 NIC driver extracted from the
-[elliott10/e1000-driver](https://github.com/elliott10/e1000-driver) fork.
-It provides trait-based abstractions for register access and DMA, a
-`split()` API for concurrent RX/TX use, and zero-copy packet I/O.
-
-`no_std`, no `alloc` dependency. Extracted from the
-[elliott10/e1000-driver](https://github.com/elliott10/e1000-driver) fork
-(original removed from repo).
+The `crates/embclox-e1000` crate is a clean e1000 NIC driver extracted
+from the [elliott10/e1000-driver](https://github.com/elliott10/e1000-driver)
+fork. `no_std`, no `alloc` dependency, log only.
 
 ## Traits
 
 ### RegisterAccess
 
 ```rust
-/// MMIO register access. Offset is a word index (byte offset / 4).
-/// Uses &self — MMIO side-effects are in hardware, not Rust memory.
 pub trait RegisterAccess {
-    fn read_reg(&self, offset: usize) -> u32;
+    fn read_reg(&self, offset: usize) -> u32;   // word index
     fn write_reg(&self, offset: usize, value: u32);
 }
 ```
 
-Implementations must use volatile reads/writes. If `R: Copy` (e.g., a
-raw base pointer wrapper), each split half gets its own copy.
+Implementations must use volatile reads/writes. `MmioRegs` in
+`embclox-core` provides the standard x86 implementation.
 
 ### DmaAllocator
 
@@ -33,77 +26,29 @@ raw base pointer wrapper), each split half gets its own copy.
 pub struct DmaRegion { pub vaddr: usize, pub paddr: usize, pub size: usize }
 
 pub trait DmaAllocator {
-    fn alloc_coherent(&self, size: usize, align: usize) -> DmaRegion;  // panics on failure
-    fn free_coherent(&self, region: &DmaRegion);
+    fn alloc_coherent(&self, size: usize, align: usize) -> DmaRegion;
+    unsafe fn free_coherent(&self, region: &DmaRegion);
 }
 ```
 
-Uses `&self` (interior mutability for stateful allocators). Panics on
-failure — boot-time, fixed system, no recovery path. The driver makes
-4 bulk allocations (TX ring, RX ring, TX buffers, RX buffers).
+`free_coherent` is `unsafe` (like `Allocator::deallocate`) — caller must
+ensure no references to the region exist. `E1000Device::Drop` calls it
+automatically after resetting the device.
 
 ## Device API
 
-```rust
-impl<R: RegisterAccess, D: DmaAllocator> E1000Device<R, D> {
-    /// Caller must reset device and re-enable PCI bus mastering first.
-    pub fn new(regs: R, dma: D) -> Self;
-    pub fn mac_address(&self) -> [u8; 6];
-    pub fn link_is_up(&self) -> bool;
-    pub fn split(&mut self) -> (RxHalf<'_, R>, TxHalf<'_, R>);
+- `new(regs, dma)` — init rings, enable TX/RX (caller must reset first)
+- `mac_address()`, `link_is_up()`
+- `split()` → `(RxHalf, TxHalf)` for concurrent use
+- `enable_interrupts()`, `disable_interrupts()`, `handle_interrupt()`
+- `enable_loopback()` — MAC internal loopback (RCTL.LBM)
+- `Drop` — full device reset + free all DMA regions
 
-    // Interrupts — &self, callable even while split
-    pub fn enable_interrupts(&self);
-    pub fn disable_interrupts(&self);
-    pub fn handle_interrupt(&self) -> InterruptStatus;
-}
+## Shared helpers (`embclox-core::e1000_helpers`)
 
-impl RxHalf<'_, R> {
-    pub fn has_rx_packet(&self) -> bool;
-    pub fn recv_with<T>(&mut self, f: impl FnOnce(&mut [u8]) -> T) -> Option<T>;
-}
-
-impl TxHalf<'_, R> {
-    pub fn has_tx_space(&self) -> bool;
-    pub fn transmit(&mut self, packet: &[u8]);
-    pub fn transmit_with<T>(&mut self, len: usize, f: impl FnOnce(&mut [u8]) -> T) -> Option<T>;
-}
-```
-
-### Split design
-
-`RxHalf` and `TxHalf` share `&R` (register access via `&self`) and hold
-`&mut` to disjoint ring state. Interrupt methods use `&self` so they
-remain callable while split. The Embassy adapter still uses `UnsafeCell`
-because the `Driver::receive()` trait signature requires both tokens from
-`&mut self`, but each token calls `split()` independently on consume.
-
-## Caller responsibilities
-
-Before calling `new()`, the caller must:
-1. Perform device reset (write `CTRL_RST`, wait for clear)
-2. Re-enable PCI bus mastering (reset clears command register)
-3. Set `CTRL_SLU | CTRL_ASDE` (link up, auto-speed)
-4. Clear flow control registers (FCAL, FCAH, FCT, FCTTV)
-
-`new()` handles post-reset init: TX/RX ring setup, TCTL, RCTL,
-interrupt configuration.
-
-## File structure
-
-```
-crates/e1000/
-    ├── Cargo.toml    # no_std, log dependency only
-    └── src/
-        ├── lib.rs    # re-exports
-        ├── regs.rs   # RegisterAccess trait + register constants
-        ├── dma.rs    # DmaAllocator trait + DmaRegion
-        ├── desc.rs   # TxDesc, RxDesc, ring state, constants
-        ├── device.rs # E1000Device, RxHalf, TxHalf, Drop
-        └── error.rs  # InterruptStatus
-```
+- `reset_device(regs)` — disable IRQ, CTRL_RST, wait, set SLU|ASDE
+- `new_device(regs, dma)` — reset + bus mastering + `E1000Device::new`
 
 ## References
 
 - [Intel 82540 SDM](https://pdos.csail.mit.edu/6.828/2019/readings/hardware/8254x_GBe_SDM.pdf)
-- [Redox OS e1000d](https://github.com/redox-os/drivers/blob/master/net/e1000d/src/device.rs)

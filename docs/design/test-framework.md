@@ -72,13 +72,19 @@ ctest --test-dir build -R integration       # integration only
 ## Project layout
 
 ```
-scripts/qemu-test.sh             # shared QEMU runner
-qemu-tests/unit/                 # unit test binary (no_std)
-├── src/main.rs                  # boot, HAL init, run suites, exit
-├── src/harness.rs               # TestCase, run_suite(), qemu_exit()
-└── src/suites/e1000_smoke.rs    # e1000 smoke tests (3 tests)
-crates/embclox-test-macros/      # #[test_suite] proc macro
-CMakeLists.txt                   # ctest integration (unit + integration)
+scripts/qemu-test.sh                  # shared QEMU runner
+qemu-tests/unit/                      # unit test binary (no_std)
+├── src/main.rs                       # boot, HAL init, run suites, exit
+├── src/harness.rs                    # TestCase, run_suite(), qemu_exit()
+└── src/suites/                       # test suites:
+    ├── hal_pci.rs                    #   PCI scan, BAR, bus mastering (4)
+    ├── hal_memory.rs                 #   heap alloc, MMIO map/unmap (4)
+    ├── e1000_smoke.rs                #   register read, MAC, init+split (3)
+    ├── e1000_driver.rs               #   link, TX, interrupts, loopback, ARP (9)
+    └── e1000_embassy.rs              #   adapter caps, stack init (2)
+crates/embclox-test-macros/           # #[test_suite] proc macro
+crates/embclox-core/                  # shared: DMA, MMIO, Embassy adapter, helpers
+CMakeLists.txt                        # ctest integration (unit + integration)
 ```
 
 ## Adding a new test suite

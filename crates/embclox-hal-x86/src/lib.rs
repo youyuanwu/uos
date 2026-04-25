@@ -63,10 +63,11 @@ pub fn init(boot_info: &'static mut BootInfo, config: Config) -> Peripherals {
         .expect("physical_memory_offset not available");
 
     // kernel_offset: the difference between kernel virtual addresses and
-    // physical addresses. Derived from the bootloader's physical_memory_offset
-    // and a known virtual address. For bootloader v0.11 on QEMU this is
-    // consistently 0xFFFF000000. A future improvement could compute this
-    // dynamically from the memory map.
+    // physical addresses. For bootloader v0.11, this is the
+    // virtual_address_offset shown in the boot log.
+    // Note: boot_info.kernel_image_offset is a different value (the offset
+    // within the kernel image, not the virtual-to-physical offset).
+    // TODO: compute dynamically instead of hardcoding.
     let kernel_offset: u64 = 0xFFFF000000;
 
     log::info!("Physical memory offset: {:#x}", phys_offset);

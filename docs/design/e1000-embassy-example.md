@@ -2,9 +2,9 @@
 
 ## Overview
 
-A bare-metal TCP echo server on x86_64 QEMU using `crates/e1000` driver
-and `crates/hal-x86` platform HAL with [Embassy](https://embassy.dev)'s
-async executor and `embassy-net` (smoltcp). Tested via `test.sh`.
+A bare-metal TCP echo server on x86_64 QEMU using `embclox-e1000`
+driver, `embclox-hal-x86` HAL, and `embclox-core` glue with
+[Embassy](https://embassy.dev)'s async executor and `embassy-net`.
 
 ## Architecture
 
@@ -14,72 +14,43 @@ async executor and `embassy-net` (smoltcp). Tested via `test.sh`.
 ├─────────────────────────────────────────────┤
 │  embassy-net (IP/ARP/TCP via smoltcp)       │
 ├─────────────────────────────────────────────┤
-│  Embassy adapter (UnsafeCell + split())     │
-├──────────────┬──────────────────────────────┤
-│  crates/e1000│  crates/hal-x86             │
-│  (driver)    │  (serial, PCI, MMIO, heap)  │
-└──────────────┴──────────────────────────────┘
+│  embclox-core::e1000_embassy (Driver impl)  │
+├───────────────┬─────────────────────────────┤
+│  embclox-e1000│  embclox-hal-x86            │
+│  (driver)     │  (serial, PCI, MMIO, heap)  │
+└───────────────┴─────────────────────────────┘
         ↕ MMIO (UC-mapped)      ↕ DMA (phys_offset)
 ┌─────────────────────────────────────────────┐
 │  QEMU x86_64 q35 + e1000 NIC               │
 └─────────────────────────────────────────────┘
 ```
 
-## Key Design Decisions
+## Shared crates
 
-**Interrupt-driven** — APIC timer (~1ms) for `embassy-time` alarms,
-e1000 RX interrupt via IOAPIC for network wakeup. Executor halts
-(`hlt`) when idle — CPU near-zero when no packets.
+| Crate | Contents |
+|---|---|
+| `embclox-core` | `BootDmaAllocator`, `MmioRegs`, `E1000Embassy` adapter, `e1000_helpers` |
+| `embclox-e1000` | Driver (RegisterAccess, DmaAllocator, E1000Device) |
+| `embclox-hal-x86` | HAL (serial, PCI, MMIO, heap, timers, interrupts) |
 
-**Caller does device reset** — `main.rs` performs CTRL_RST, waits for
-clear, sets SLU|ASDE, disables flow control, re-enables PCI bus
-mastering, then calls `E1000Device::new()`.
-
-**UnsafeCell for Embassy adapter** — Embassy's `Driver::receive()` needs
-both tokens from `&mut self`. Adapter wraps device in `UnsafeCell`, each
-token calls `split()` on consume. ISR only touches `AtomicWaker`.
-
-**AtomicWaker** — `receive()` registers waker via `NET_WAKER.register()`.
-E1000 ISR reads ICR and calls `NET_WAKER.wake()`.
-
-**DMA through `phys_offset`** — QEMU TCG DMA coherency requires
-addresses via the bootloader's physical memory mapping.
-
-**Gratuitous ARP** — QEMU slirp workaround for RX readiness.
-
-## Project Layout
+## Project layout
 
 ```
-_examples_embassy/
-    ├── .cargo/config.toml       # target = x86_64-unknown-none
-    ├── Cargo.toml
-    ├── test.sh                  # QEMU boot + TCP echo verification
-    └── src/
-        ├── main.rs              # boot, reset, init, executor, echo task
-        ├── e1000_adapter.rs     # embassy-net-driver impl
-        ├── dma_alloc.rs         # e1000::DmaAllocator impl
-        └── mmio_regs.rs         # e1000::RegisterAccess impl
+examples/
+├── .cargo/config.toml       # target = x86_64-unknown-none
+├── Cargo.toml
+└── src/main.rs              # boot, reset, init, executor, echo task
 
-crates/e1000/                    # driver (see e1000-driver-refactor.md)
-crates/hal-x86/                  # platform HAL (see hal-x86.md)
-tools/mkimage/                   # BIOS disk image builder
+crates/embclox-core/         # shared glue (DMA, MMIO, Embassy adapter)
+crates/embclox-e1000/        # driver (see e1000-driver-refactor.md)
+crates/embclox-hal-x86/      # platform HAL (see hal-x86.md)
+tools/embclox-mkimage/       # BIOS disk image builder
 ```
 
 Build: `cmake -B build && cmake --build build --target image`
-Test: `cmake --build build --target test`
-
-## Toolchain
-
-Stable Rust with `RUSTC_BOOTSTRAP=1` (root `.cargo/config.toml`).
-Static IP `10.0.2.15/24`, gateway `10.0.2.2` (QEMU slirp defaults).
+Test: `ctest --test-dir build`
 
 ## Future Work
 
 - DHCP (embassy-time alarms now work)
 - `embedded-io-async::Write` for serial (needs interrupt-driven UART)
-
-## References
-
-- [Embassy](https://embassy.dev) / [embassy-net](https://docs.embassy.dev/embassy-net/)
-- [bootloader crate](https://docs.rs/bootloader/)
-- [Intel 82540 SDM](https://pdos.csail.mit.edu/6.828/2019/readings/hardware/8254x_GBe_SDM.pdf)
