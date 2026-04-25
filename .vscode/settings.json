@@ -1,0 +1,3 @@
+{
+    "rust-analyzer.check.extraArgs": ["--exclude", "e1000-embassy-example"]
+}

@@ -4,21 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-embassy-executor = { version = "0.10", features = ["platform-spin", "executor-thread"] }
-embassy-net = { version = "0.9", features = ["tcp", "udp", "medium-ethernet", "proto-ipv4", "log"] }
-embassy-net-driver = "0.2"
-embassy-time = { version = "0.5", features = ["tick-hz-1_000_000"] }
-embassy-sync = "0.8"
+embassy-executor.workspace = true
+embassy-net.workspace = true
+embassy-net-driver.workspace = true
+embassy-time.workspace = true
+embassy-time-driver.workspace = true
+embassy-sync.workspace = true
+embassy-futures.workspace = true
+embedded-io-async.workspace = true
 
-e1000-driver = { path = "../external/e1000" }
-bootloader_api = "0.11"
-x86_64 = "0.15"
-uart_16550 = "0.3"
-log = "0.4"
-static_cell = "2"
-linked_list_allocator = "0.10"
-critical-section = { version = "1", features = ["restore-state-bool"] }
-spin = "0.9"
-embassy-futures = "0.1.2"
-embedded-io-async = "0.7.0"
-embassy-time-driver = "0.2.2"
+e1000-driver.workspace = true
+bootloader_api.workspace = true
+x86_64.workspace = true
+uart_16550.workspace = true
+log.workspace = true
+static_cell.workspace = true
+linked_list_allocator.workspace = true
+critical-section.workspace = true
+spin.workspace = true

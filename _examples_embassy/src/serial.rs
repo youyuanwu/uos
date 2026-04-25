@@ -1,14 +1,14 @@
 use core::fmt;
 use core::fmt::Write;
 use spin::Mutex;
-use uart_16550::SerialPort;
+use uart_16550::{Config, Uart16550Tty, backend::PioBackend};
 
-static SERIAL1: Mutex<Option<SerialPort>> = Mutex::new(None);
+static SERIAL1: Mutex<Option<Uart16550Tty<PioBackend>>> = Mutex::new(None);
 
 pub fn init() {
-    let mut port = unsafe { SerialPort::new(0x3F8) };
-    port.init();
-    *SERIAL1.lock() = Some(port);
+    let tty = unsafe { Uart16550Tty::new_port(0x3F8, Config::default()) }
+        .expect("failed to init serial port");
+    *SERIAL1.lock() = Some(tty);
     let _ = crate::logger::init();
 }
 
