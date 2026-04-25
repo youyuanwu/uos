@@ -4,33 +4,33 @@ use embclox_e1000::RegisterAccess;
 use embclox_e1000::regs::*;
 
 /// Global test context set by main before running suites.
-static mut CTX: Option<E1000TestCtx> = None;
-
-pub struct E1000TestCtx {
-    pub regs: MmioRegs,
-    pub kernel_offset: u64,
-    pub phys_offset: u64,
-}
+static mut CTX: Option<(MmioRegs, BootDmaAllocator)> = None;
 
 /// Initialize the e1000 test context. Called once from main.
 ///
 /// # Safety
 /// Must be called before `suite()` and only from single-threaded init.
-pub unsafe fn init(regs: MmioRegs, kernel_offset: u64, phys_offset: u64) {
+pub unsafe fn init(regs: MmioRegs, dma: BootDmaAllocator) {
     unsafe {
-        *core::ptr::addr_of_mut!(CTX) = Some(E1000TestCtx {
-            regs,
-            kernel_offset,
-            phys_offset,
-        });
+        *core::ptr::addr_of_mut!(CTX) = Some((regs, dma));
     }
 }
 
-fn ctx() -> &'static E1000TestCtx {
+fn regs() -> &'static MmioRegs {
     unsafe {
-        (*core::ptr::addr_of!(CTX))
+        &(*core::ptr::addr_of!(CTX))
             .as_ref()
             .expect("e1000 test context not initialized")
+            .0
+    }
+}
+
+fn dma() -> &'static BootDmaAllocator {
+    unsafe {
+        &(*core::ptr::addr_of!(CTX))
+            .as_ref()
+            .expect("e1000 test context not initialized")
+            .1
     }
 }
 
@@ -44,8 +44,7 @@ mod tests {
     /// STATUS register bit 1 (link up) should be set on QEMU's e1000.
     #[test]
     fn status_link_up() {
-        let regs = &ctx().regs;
-        let status = regs.read_reg(STAT);
+        let status = regs().read_reg(STAT);
         assert!(
             status & 0x2 != 0,
             "e1000 link should be up, STATUS={:#x}",
@@ -56,9 +55,8 @@ mod tests {
     /// RAL/RAH registers should contain a non-zero MAC address.
     #[test]
     fn mac_address_nonzero() {
-        let regs = &ctx().regs;
-        let ral = regs.read_reg(RAL);
-        let rah = regs.read_reg(RAH);
+        let ral = regs().read_reg(RAL);
+        let rah = regs().read_reg(RAH);
         assert!(ral != 0 || rah != 0, "MAC address should not be zero");
     }
 
@@ -66,12 +64,7 @@ mod tests {
     /// RX/TX halves, confirm no pending RX packets, and transmit a frame.
     #[test]
     fn init_device_and_split() {
-        let c = ctx();
-        let dma = BootDmaAllocator {
-            kernel_offset: c.kernel_offset,
-            phys_offset: c.phys_offset,
-        };
-        let mut dev = embclox_e1000::E1000Device::new(c.regs, dma);
+        let mut dev = embclox_e1000::E1000Device::new(*regs(), dma().clone());
         let mac = dev.mac_address();
         assert!(mac != [0; 6], "MAC should not be all zeros");
 

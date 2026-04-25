@@ -7,6 +7,7 @@ use log::*;
 /// Translates kernel heap addresses to physical addresses for DMA, and
 /// returns virtual addresses through the bootloader's physical memory
 /// mapping so CPU reads are coherent with DMA writes in QEMU TCG mode.
+#[derive(Clone)]
 pub struct BootDmaAllocator {
     /// Offset to convert kernel virtual addresses to physical:
     ///   paddr = kernel_vaddr - kernel_offset
@@ -33,7 +34,7 @@ impl DmaAllocator for BootDmaAllocator {
         DmaRegion { vaddr, paddr, size }
     }
 
-    fn free_coherent(&self, region: &DmaRegion) {
+    unsafe fn free_coherent(&self, region: &DmaRegion) {
         let paddr = region.vaddr - self.phys_offset as usize;
         let heap_vaddr = paddr + self.kernel_offset as usize;
         let layout = Layout::from_size_align(region.size, 4096).unwrap();

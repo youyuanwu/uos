@@ -26,34 +26,49 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut p = embclox_hal_x86::init(boot_info, embclox_hal_x86::Config::default());
     info!("=== embclox test runner ===");
 
-    // --- HAL test context ---
+    let mut total = 0usize;
+
+    // --- HAL tests (no device setup needed) ---
+
+    // hal_pci: PciBus is zero-sized, no init needed
+    let (name, tests) = suites::hal_pci::suite();
+    total += harness::run_suite(name, tests);
+
+    // hal_memory: init with a MemoryMapper, run before e1000 maps BAR0
+    // (tests map/unmap cleanly, leaving pages free for later use)
+    unsafe {
+        suites::hal_memory::init(p.memory.phys_offset(), p.memory.kernel_offset());
+    }
+    let (name, tests) = suites::hal_memory::suite();
+    total += harness::run_suite(name, tests);
+
+    // --- e1000 tests (need PCI scan, BAR0 map, device reset) ---
+
     let pci_dev = p
         .pci
         .find_device_any(0x8086, &[0x100E, 0x100F, 0x10D3])
         .expect("e1000 device not found on PCI bus");
     let bar0_phys = p.pci.read_bar(&pci_dev, 0);
-
-    // --- e1000 test context (needs static for device setup state) ---
-    let e1000_vaddr = p.memory.map_mmio(bar0_phys, 0x20000);
-    let regs = MmioRegs::new(e1000_vaddr);
+    let e1000_mmio = p.memory.map_mmio(bar0_phys, 0x20000);
+    let regs = MmioRegs::new(e1000_mmio.vaddr());
     e1000_reset(&regs);
     p.pci.enable_bus_mastering(&pci_dev);
 
     unsafe {
-        suites::e1000_smoke::init(regs, p.memory.kernel_offset(), p.memory.phys_offset());
+        suites::e1000_smoke::init(
+            regs,
+            embclox_core::dma_alloc::BootDmaAllocator {
+                kernel_offset: p.memory.kernel_offset(),
+                phys_offset: p.memory.phys_offset(),
+            },
+        );
     }
-
-    // --- Run all test suites ---
-    let mut total = 0usize;
-
-    let (name, tests) = suites::hal_pci::suite();
-    total += harness::run_suite(name, tests);
-
-    let (name, tests) = suites::hal_memory::suite();
-    total += harness::run_suite(name, tests);
-
     let (name, tests) = suites::e1000_smoke::suite();
     total += harness::run_suite(name, tests);
+
+    // Clean up MMIO mapping
+    // Safety: e1000_smoke tests are done, no references to mapped memory remain.
+    unsafe { p.memory.unmap_mmio(&e1000_mmio) };
 
     info!("=== {} passed ===", total);
     harness::qemu_exit(0);

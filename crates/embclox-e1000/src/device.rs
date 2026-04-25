@@ -225,12 +225,19 @@ impl<R: RegisterAccess, D: DmaAllocator> E1000Device<R, D> {
     }
 }
 
+/// Frees all DMA regions on drop. Does not reset the device — caller
+/// should disable interrupts and reset before dropping if the device
+/// will be reused.
 impl<R: RegisterAccess, D: DmaAllocator> Drop for E1000Device<R, D> {
     fn drop(&mut self) {
-        self.dma.free_coherent(&self.tx_ring_dma);
-        self.dma.free_coherent(&self.rx_ring_dma);
-        self.dma.free_coherent(&self.tx_bufs_dma);
-        self.dma.free_coherent(&self.rx_bufs_dma);
+        // Safety: E1000Device owns these DMA regions exclusively.
+        // No other references exist after drop.
+        unsafe {
+            self.dma.free_coherent(&self.tx_ring_dma);
+            self.dma.free_coherent(&self.rx_ring_dma);
+            self.dma.free_coherent(&self.tx_bufs_dma);
+            self.dma.free_coherent(&self.rx_bufs_dma);
+        }
     }
 }
 

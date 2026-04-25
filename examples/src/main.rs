@@ -73,11 +73,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     embclox_hal_x86::idt::init();
     embclox_hal_x86::pic::disable();
 
-    // Map LAPIC
-    let lapic_vaddr = p
+    // Map LAPIC (kept alive for program lifetime — used by ISR)
+    let _lapic_mmio = p
         .memory
         .map_mmio(embclox_hal_x86::apic::LAPIC_PHYS_BASE, 0x1000);
-    let mut lapic_dev = LocalApic::new(lapic_vaddr);
+    let mut lapic_dev = LocalApic::new(_lapic_mmio.vaddr());
     lapic_dev.enable();
 
     // Calibrate TSC via PIT
@@ -98,11 +98,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Store global LAPIC for ISR access
     unsafe { *core::ptr::addr_of_mut!(LAPIC) = Some(lapic_dev) };
 
-    // Map IOAPIC
-    let ioapic_vaddr = p
+    // Map IOAPIC (kept alive for program lifetime)
+    let _ioapic_mmio = p
         .memory
         .map_mmio(embclox_hal_x86::ioapic::IOAPIC_PHYS_BASE, 0x1000);
-    let mut ioapic = IoApic::new(ioapic_vaddr);
+    let mut ioapic = IoApic::new(_ioapic_mmio.vaddr());
     ioapic.log_info();
 
     // --- PCI + e1000 ---
@@ -112,11 +112,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .expect("e1000 device not found on PCI bus");
     let bar0_phys = p.pci.read_bar(&pci_dev, 0);
 
-    // Map e1000 BAR0 MMIO with Uncacheable pages
-    let e1000_vaddr = p.memory.map_mmio(bar0_phys, 0x20000);
-    info!("e1000 MMIO vaddr: {:#x}", e1000_vaddr);
+    // Map e1000 BAR0 MMIO (kept alive for program lifetime)
+    let _e1000_mmio = p.memory.map_mmio(bar0_phys, 0x20000);
+    info!("e1000 MMIO vaddr: {:#x}", _e1000_mmio.vaddr());
 
-    let regs = MmioRegs::new(e1000_vaddr);
+    let regs = MmioRegs::new(_e1000_mmio.vaddr());
 
     // Caller performs device reset before new() per driver contract
     e1000_reset(&regs);
@@ -150,7 +150,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // --- E1000 interrupt setup ---
     // Store MMIO base for ISR
-    E1000_REGS_BASE.store(e1000_vaddr, core::sync::atomic::Ordering::Relaxed);
+    E1000_REGS_BASE.store(_e1000_mmio.vaddr(), core::sync::atomic::Ordering::Relaxed);
 
     // Read e1000 IRQ from PCI interrupt line register
     let e1000_irq = (p.pci.read_config(&pci_dev, 0x3C) & 0xFF) as u8;

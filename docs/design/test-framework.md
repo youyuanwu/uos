@@ -101,13 +101,14 @@ on what the test needs:
 
 ### Why e1000 tests use a static
 
-`E1000Device::new()` allocates ~1MB of DMA memory (4 bulk allocations)
-and configures TX/RX rings in device registers. The driver has no
-`Drop` impl or `deinit()` method — creating a device per test would
-leak DMA memory and exhaust the heap. The `map_mmio` call also can't
-be repeated for the same physical address (page already mapped).
+Test functions are `fn()` — no arguments. The e1000 device setup
+(PCI scan, BAR0 mapping, device reset, bus mastering) must happen once
+in `main` before tests run, and the resulting MMIO address and DMA
+offsets need to be accessible from test functions. A `static mut`
+context is the simplest way to bridge `main` → test functions in
+`no_std` without closures or trait objects.
 
-To enable per-test init/teardown, the driver would need a `Drop` impl
-that frees DMA regions and resets the device. This is a future
-improvement — for now, e1000 device state is initialized once and
-shared across all tests in the suite.
+The device itself (`E1000Device`) has a `Drop` impl that frees DMA
+memory, so creating one per test is technically possible. However,
+`map_mmio` cannot re-map the same physical address (page table
+conflict), so the MMIO setup must still be shared.
