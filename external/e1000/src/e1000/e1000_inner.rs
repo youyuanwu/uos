@@ -187,14 +187,32 @@ impl<K: KernelFunc> E1000Device<'_, K> {
         // Reset the device
         self.regs[E1000_IMS].write(0); // disable interrupts
         self.regs[E1000_CTL].write(ctl | E1000_CTL_RST);
+
+        // Wait for reset to complete
+        loop {
+            let v = self.regs[E1000_CTL].read();
+            if v & E1000_CTL_RST == 0 {
+                break;
+            }
+        }
+
         self.regs[E1000_IMS].write(0); // redisable interrupts
+
+        // Set link up, auto-speed detection after reset
+        self.regs[E1000_CTL].write(E1000_CTL_SLU | E1000_CTL_ASDE);
+
+        // Disable flow control
+        self.regs[E1000_FCAL].write(0);
+        self.regs[E1000_FCAH].write(0);
+        self.regs[E1000_FCT].write(0);
+        self.regs[E1000_FCTTV].write(0);
 
         // 内存壁垒 fence
         //__sync_synchronize();
         fence_w();
 
         // [E1000 14.5] Transmit initialization
-        if (core::mem::size_of_val(self.tx_ring)) % 128 != 0 {
+        if !(core::mem::size_of_val(self.tx_ring)).is_multiple_of(128) {
             //panic("e1000");
             error!("e1000, size of tx_ring is invalid");
         }
@@ -217,7 +235,7 @@ impl<K: KernelFunc> E1000Device<'_, K> {
 
         // [E1000 14.4] Receive initialization
         info!("rx ring 0: {:x?}", self.rx_ring[0]);
-        if (core::mem::size_of_val(self.rx_ring)) % 128 != 0 {
+        if !(core::mem::size_of_val(self.rx_ring)).is_multiple_of(128) {
             error!("e1000, size of rx_ring is invalid");
         }
 
@@ -226,6 +244,8 @@ impl<K: KernelFunc> E1000Device<'_, K> {
             (
                 E1000_RCTL_EN |  // enable receiver
             E1000_RCTL_BAM |  // enable broadcast
+            E1000_RCTL_UPE |  // unicast promiscuous
+            E1000_RCTL_MPE |  // multicast promiscuous
             E1000_RCTL_SZ_2048 |  // 2048-byte rx buffers
             E1000_RCTL_SECRC
                 // strip CRC
@@ -333,11 +353,7 @@ impl<K: KernelFunc> E1000Device<'_, K> {
 
             let mbuf = unsafe { from_raw_parts_mut(self.rx_mbufs[rindex] as *mut u8, len) };
             info!("RX PKT {} <<<<<<<<<", len);
-            //recv_packets.push_back(mbuf.to_vec());
             recv_packets.push(mbuf.to_vec());
-
-            // Deliver the mbuf to the network stack
-            net_rx(mbuf);
 
             fence();
             // Just need to clear 64 bits header
@@ -355,9 +371,9 @@ impl<K: KernelFunc> E1000Device<'_, K> {
         info!("e1000_recv\n\r");
 
         if recv_packets.is_empty() {
-            Some(recv_packets)
-        } else {
             None
+        } else {
+            Some(recv_packets)
         }
     }
 
@@ -386,6 +402,59 @@ impl<K: KernelFunc> E1000Device<'_, K> {
     /// Cause a link status change interrupt
     pub fn e1000_cause_lsc_int(&mut self) {
         self.regs[E1000_ICS].write(E1000_ICR_LSC);
+    }
+
+    /// Check if a received packet is ready without consuming it.
+    pub fn has_rx_packet(&self) -> bool {
+        let rindex = (self.regs[E1000_RDT].read() as usize + 1) % RX_RING_SIZE;
+        let addr = unsafe { core::ptr::read_volatile(&self.rx_ring[rindex].addr) };
+        let status = unsafe { core::ptr::read_volatile(&self.rx_ring[rindex].status) };
+        addr != 0 && (status & E1000_RXD_STAT_DD as u8) != 0
+    }
+
+    /// Check if a TX descriptor is available.
+    pub fn has_tx_space(&self) -> bool {
+        let tindex = self.regs[E1000_TDT].read() as usize;
+        (self.tx_ring[tindex].status & E1000_TXD_STAT_DD as u8) != 0
+    }
+
+    /// Receive one packet via zero-copy callback.
+    /// The closure `f` receives a `&mut [u8]` slice directly into the
+    /// DMA buffer. The descriptor is recycled after `f` returns.
+    /// Returns `None` if no complete packet is available.
+    pub fn e1000_recv_with<R, F: FnOnce(&mut [u8]) -> R>(&mut self, f: F) -> Option<R> {
+        let rindex = (self.regs[E1000_RDT].read() as usize + 1) % RX_RING_SIZE;
+        if self.rx_ring[rindex].addr == 0 {
+            return None;
+        }
+        let status = self.rx_ring[rindex].status;
+        // Require both DD (descriptor done) and EOP (end of packet)
+        if (status & (E1000_RXD_STAT_DD | E1000_RXD_STAT_EOP) as u8)
+            != (E1000_RXD_STAT_DD | E1000_RXD_STAT_EOP) as u8
+        {
+            return None;
+        }
+        // Drop packets with RX errors
+        if self.rx_ring[rindex].errors != 0 {
+            self.rx_ring[rindex].status = 0;
+            self.regs[E1000_RDT].write(rindex as u32);
+            self.e1000_write_flush();
+            return None;
+        }
+
+        fence_r(); // read barrier before accessing DMA buffer contents
+        let len = min(self.rx_ring[rindex].length as usize, self.mbuf_size);
+        let mbuf = unsafe { from_raw_parts_mut(self.rx_mbufs[rindex] as *mut u8, len) };
+        let result = f(mbuf);
+
+        fence();
+        mbuf[..min(64, len)].fill(0);
+        self.rx_ring[rindex].status = 0;
+        self.regs[E1000_RDT].write(rindex as u32);
+        self.e1000_write_flush();
+        fence_w();
+
+        Some(result)
     }
 
     /// To handle e1000 interrupt

@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "external/e1000",
+    "tools/mkimage",
+]

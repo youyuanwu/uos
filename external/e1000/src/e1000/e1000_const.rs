@@ -4,6 +4,10 @@
 /* Registers */
 pub(crate) const E1000_CTL: usize = 0x00000; /* Device Control Register - RW */
 pub(crate) const E1000_STAT: usize = 0x00008 / 4; /* Device Status Register - R */
+pub(crate) const E1000_FCAL: usize = 0x00028 / 4; /* Flow Control Address Low - RW */
+pub(crate) const E1000_FCAH: usize = 0x0002C / 4; /* Flow Control Address High - RW */
+pub(crate) const E1000_FCT: usize = 0x00030 / 4; /* Flow Control Type - RW */
+pub(crate) const E1000_FCTTV: usize = 0x00170 / 4; /* Flow Control Transmit Timer Value - RW */
 pub(crate) const E1000_ICR: usize = 0x000C0 / 4; /* Interrupt Cause Read - R */
 pub(crate) const E1000_ITR: usize = 0x000C4 / 4; /* Interrupt Throttling Rate - RW */
 pub(crate) const E1000_ICS: usize = 0x000C8 / 4; /* Interrupt Cause Set - WO */
@@ -53,6 +57,7 @@ pub(crate) const E1000_IMS_RXT0: u32 = 0x00000080;
 pub(crate) const E1000_ICR_LSC: u32 = 0x00000004; /* Link Status Change */
 
 /* Device Control */
+pub(crate) const E1000_CTL_ASDE: u32 = 0x00000020; /* auto-speed detection enable */
 pub(crate) const E1000_CTL_SLU: u32 = 0x00000040; /* set link up */
 pub(crate) const E1000_CTL_FRCSPD: u32 = 0x00000800; /* force speed */
 pub(crate) const E1000_CTL_FRCDPLX: u32 = 0x00001000; /* force duplex */
