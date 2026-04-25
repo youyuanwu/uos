@@ -2,7 +2,8 @@ use crate::desc::*;
 use crate::dma::{DmaAllocator, DmaRegion};
 use crate::error::InterruptStatus;
 use crate::regs::{
-    self, RegisterAccess, RXD_STAT_DD, RXD_STAT_EOP, TXD_CMD_EOP, TXD_CMD_RS, TXD_STAT_DD,
+    self, RegisterAccess, CTL, CTL_RST, IMS, RXD_STAT_DD, RXD_STAT_EOP, TXD_CMD_EOP, TXD_CMD_RS,
+    TXD_STAT_DD,
 };
 use core::cmp::min;
 use core::sync::atomic::{fence, Ordering};
@@ -225,13 +226,29 @@ impl<R: RegisterAccess, D: DmaAllocator> E1000Device<R, D> {
     }
 }
 
-/// Frees all DMA regions on drop. Does not reset the device — caller
-/// should disable interrupts and reset before dropping if the device
-/// will be reused.
+/// Resets the device and frees all DMA regions on drop.
+/// The device is left in a clean post-reset state, safe for re-init.
 impl<R: RegisterAccess, D: DmaAllocator> Drop for E1000Device<R, D> {
     fn drop(&mut self) {
+        // Disable interrupts and reset the device before freeing DMA.
+        // This ensures the NIC stops all DMA activity before we free
+        // the ring and buffer memory it was using.
+        self.regs.write_reg(IMS, 0);
+        let ctl = self.regs.read_reg(CTL);
+        self.regs.write_reg(CTL, ctl | CTL_RST);
+
+        // Wait for reset to complete (CTL_RST self-clears)
+        let mut timeout = 100_000u32;
+        while self.regs.read_reg(CTL) & CTL_RST != 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                log::warn!("e1000 reset timeout in Drop — freeing DMA anyway");
+                break;
+            }
+        }
+
         // Safety: E1000Device owns these DMA regions exclusively.
-        // No other references exist after drop.
+        // Device is reset, no DMA activity can reference this memory.
         unsafe {
             self.dma.free_coherent(&self.tx_ring_dma);
             self.dma.free_coherent(&self.rx_ring_dma);

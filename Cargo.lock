@@ -300,6 +300,8 @@ dependencies = [
 name = "embclox-core"
 version = "0.1.0"
 dependencies = [
+ "embassy-net-driver",
+ "embassy-sync",
  "embclox-e1000",
  "embclox-hal-x86",
  "log",
@@ -368,11 +370,19 @@ name = "embclox-unit-tests"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-net-driver",
+ "embassy-sync",
+ "embassy-time",
  "embclox-core",
  "embclox-e1000",
  "embclox-hal-x86",
  "embclox-test-macros",
+ "embedded-io-async",
  "log",
+ "static_cell",
  "x86_64",
 ]
 

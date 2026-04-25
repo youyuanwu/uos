@@ -54,20 +54,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     e1000_reset(&regs);
     p.pci.enable_bus_mastering(&pci_dev);
 
+    let dma = embclox_core::dma_alloc::BootDmaAllocator {
+        kernel_offset: p.memory.kernel_offset(),
+        phys_offset: p.memory.phys_offset(),
+    };
+
     unsafe {
-        suites::e1000_smoke::init(
-            regs,
-            embclox_core::dma_alloc::BootDmaAllocator {
-                kernel_offset: p.memory.kernel_offset(),
-                phys_offset: p.memory.phys_offset(),
-            },
-        );
+        suites::e1000_smoke::init(regs, dma.clone());
+        suites::e1000_driver::init(regs, dma.clone());
+        suites::e1000_embassy::init(regs, dma);
     }
+
     let (name, tests) = suites::e1000_smoke::suite();
     total += harness::run_suite(name, tests);
 
+    let (name, tests) = suites::e1000_driver::suite();
+    total += harness::run_suite(name, tests);
+
+    let (name, tests) = suites::e1000_embassy::suite();
+    total += harness::run_suite(name, tests);
+
     // Clean up MMIO mapping
-    // Safety: e1000_smoke tests are done, no references to mapped memory remain.
+    // Safety: all e1000 tests are done, no references to mapped memory remain.
     unsafe { p.memory.unmap_mmio(&e1000_mmio) };
 
     info!("=== {} passed ===", total);

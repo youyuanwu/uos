@@ -3,14 +3,23 @@ use core::task::Context;
 use embassy_net_driver::{Capabilities, HardwareAddress, LinkState};
 use embassy_sync::waitqueue::AtomicWaker;
 
-use embclox_core::dma_alloc::BootDmaAllocator;
-use embclox_core::mmio_regs::MmioRegs;
+use crate::dma_alloc::BootDmaAllocator;
+use crate::mmio_regs::MmioRegs;
 
 type Dev = embclox_e1000::E1000Device<MmioRegs, BootDmaAllocator>;
 
 /// Waker for the network runner task — signaled from the e1000 ISR.
 pub static NET_WAKER: AtomicWaker = AtomicWaker::new();
 
+/// Embassy network driver adapter for the e1000 NIC.
+///
+/// Wraps `E1000Device` and implements `embassy_net_driver::Driver`.
+/// Uses `UnsafeCell` because `Driver::receive()` returns both RX and TX
+/// tokens from `&mut self`, requiring split access to the inner device.
+///
+/// # Safety
+/// Single-core only. The ISR must only touch `NET_WAKER` (AtomicWaker),
+/// never the device itself.
 pub struct E1000Embassy {
     device: UnsafeCell<Dev>,
     mac: [u8; 6],

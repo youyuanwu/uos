@@ -5,14 +5,12 @@
 extern crate alloc;
 extern crate embclox_hal_x86;
 
-mod e1000_adapter;
-
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicUsize;
-use e1000_adapter::E1000Embassy;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use embclox_core::dma_alloc::BootDmaAllocator;
+use embclox_core::e1000_embassy::E1000Embassy;
 use embclox_core::mmio_regs::MmioRegs;
 use embclox_hal_x86::apic::LocalApic;
 use embclox_hal_x86::ioapic::IoApic;
@@ -59,7 +57,7 @@ extern "x86-interrupt" fn e1000_handler(_frame: InterruptStackFrame) {
         }
     }
     // Wake the network runner task
-    e1000_adapter::NET_WAKER.wake();
+    embclox_core::e1000_embassy::NET_WAKER.wake();
     lapic().end_of_interrupt();
 }
 
