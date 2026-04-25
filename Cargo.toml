@@ -7,12 +7,14 @@ members = [
     "qemu-tests/unit",
     "crates/embclox-e1000",
     "crates/embclox-hal-x86",
+    "crates/embclox-test-macros",
 ]
 
 default-members = [
     "tools/embclox-mkimage",
     "crates/embclox-e1000",
     "crates/embclox-hal-x86",
+    "crates/embclox-test-macros",
 ]
 
 [workspace.dependencies]
@@ -29,6 +31,7 @@ embedded-io-async = "0.7"
 # Drivers & platform
 embclox-e1000 = { path = "crates/embclox-e1000" }
 embclox-hal-x86 = { path = "crates/embclox-hal-x86" }
+embclox-test-macros = { path = "crates/embclox-test-macros" }
 bootloader = "0.11"
 bootloader_api = "0.11"
 x86_64 = "0.15"
@@ -40,3 +43,6 @@ static_cell = "2"
 linked_list_allocator = "0.10"
 critical-section = { version = "1", features = ["restore-state-bool"] }
 spin = "0.10"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

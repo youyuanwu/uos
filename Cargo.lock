@@ -345,12 +345,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "embclox-test-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "embclox-unit-tests"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
  "embclox-e1000",
  "embclox-hal-x86",
+ "embclox-test-macros",
  "log",
  "x86_64",
 ]
