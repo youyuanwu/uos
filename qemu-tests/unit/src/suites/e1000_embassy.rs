@@ -1,8 +1,6 @@
 use embclox_core::dma_alloc::BootDmaAllocator;
 use embclox_core::e1000_embassy::E1000Embassy;
 use embclox_core::mmio_regs::MmioRegs;
-use embclox_e1000::RegisterAccess;
-use embclox_e1000::regs::*;
 
 use embassy_net::{Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_net_driver::Driver;
@@ -37,25 +35,8 @@ fn dma() -> &'static BootDmaAllocator {
     }
 }
 
-/// Helper: reset and create a fresh e1000 device.
 fn new_device() -> embclox_e1000::E1000Device<MmioRegs, BootDmaAllocator> {
-    let r = regs();
-    r.write_reg(IMS, 0);
-    let ctl = r.read_reg(CTL);
-    r.write_reg(CTL, ctl | CTL_RST);
-    let mut timeout = 100_000u32;
-    while r.read_reg(CTL) & CTL_RST != 0 {
-        timeout -= 1;
-        assert!(timeout > 0, "e1000 reset timeout");
-    }
-    r.write_reg(IMS, 0);
-    r.write_reg(CTL, CTL_SLU | CTL_ASDE);
-    r.write_reg(FCAL, 0);
-    r.write_reg(FCAH, 0);
-    r.write_reg(FCT, 0);
-    r.write_reg(FCTTV, 0);
-
-    embclox_e1000::E1000Device::new(*r, dma().clone())
+    embclox_core::e1000_helpers::new_device(regs(), dma())
 }
 
 /// Embassy adapter and networking stack tests.

@@ -218,6 +218,19 @@ impl<R: RegisterAccess, D: DmaAllocator> E1000Device<R, D> {
         self.write_flush();
     }
 
+    /// Enable MAC internal loopback mode.
+    ///
+    /// Transmitted frames are routed back to the receive path internally,
+    /// without going out on the wire. Useful for testing the full TX→RX
+    /// data path without a network.
+    pub fn enable_loopback(&self) {
+        let rctl = self.regs.read_reg(regs::RCTL);
+        // Clear LBM bits (7:6) and set MAC loopback (bit 6)
+        let rctl = (rctl & !(0b11 << 6)) | regs::RCTL_LBM_MAC;
+        self.regs.write_reg(regs::RCTL, rctl);
+        self.write_flush();
+    }
+
     /// Acknowledge and return interrupt status.
     pub fn handle_interrupt(&self) -> InterruptStatus {
         let icr = self.regs.read_reg(regs::ICR);

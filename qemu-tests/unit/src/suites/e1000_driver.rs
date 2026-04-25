@@ -3,7 +3,7 @@ use embclox_core::mmio_regs::MmioRegs;
 use embclox_e1000::RegisterAccess;
 use embclox_e1000::regs::*;
 
-/// Global test context — same pattern as e1000_smoke.
+/// Global test context — shared by all e1000 driver tests.
 static mut CTX: Option<(MmioRegs, BootDmaAllocator)> = None;
 
 /// # Safety
@@ -32,27 +32,8 @@ fn dma() -> &'static BootDmaAllocator {
     }
 }
 
-/// Helper: create a fresh e1000 device (reset + init).
-/// Device is reset on drop, so each test gets clean state.
 fn new_device() -> embclox_e1000::E1000Device<MmioRegs, BootDmaAllocator> {
-    // Reset before init (required by E1000Device::new contract)
-    let r = regs();
-    r.write_reg(IMS, 0);
-    let ctl = r.read_reg(CTL);
-    r.write_reg(CTL, ctl | CTL_RST);
-    let mut timeout = 100_000u32;
-    while r.read_reg(CTL) & CTL_RST != 0 {
-        timeout -= 1;
-        assert!(timeout > 0, "e1000 reset timeout");
-    }
-    r.write_reg(IMS, 0);
-    r.write_reg(CTL, CTL_SLU | CTL_ASDE);
-    r.write_reg(FCAL, 0);
-    r.write_reg(FCAH, 0);
-    r.write_reg(FCT, 0);
-    r.write_reg(FCTTV, 0);
-
-    embclox_e1000::E1000Device::new(*r, dma().clone())
+    embclox_core::e1000_helpers::new_device(regs(), dma())
 }
 
 /// E1000 driver tests — each test creates and drops its own device,
@@ -137,6 +118,105 @@ mod tests {
             42,
             "transmit_with should return closure result"
         );
+    }
+
+    /// Verify enable_loopback sets RCTL.LBM bits correctly.
+    /// Note: QEMU's e1000 does not implement MAC loopback behavior
+    /// (packets are not actually looped back), so we only verify the
+    /// register write — not the TX→RX data path.
+    #[test]
+    fn loopback_register_set() {
+        let dev = new_device();
+        dev.enable_loopback();
+        let rctl = regs().read_reg(RCTL);
+        assert!(
+            rctl & RCTL_LBM_MAC != 0,
+            "RCTL.LBM should be set after enable_loopback, RCTL={:#x}",
+            rctl
+        );
+    }
+
+    /// Send an ARP request to QEMU slirp gateway (10.0.2.2) and verify
+    /// we receive an ARP reply. Tests the full TX→RX data path through
+    /// the QEMU network backend.
+    #[test]
+    fn arp_round_trip() {
+        let mut dev = new_device();
+        let mac = dev.mac_address();
+
+        // First send a gratuitous ARP so slirp learns our MAC
+        // (required for slirp to route replies back to us)
+        let garp: [u8; 42] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // dst: broadcast
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], // src: our MAC
+            0x08, 0x06, // ethertype: ARP
+            0x00, 0x01, // hw type: Ethernet
+            0x08, 0x00, // proto: IPv4
+            0x06, // hw size
+            0x04, // proto size
+            0x00, 0x01, // opcode: request
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], // sender MAC
+            10, 0, 2, 15, // sender IP: 10.0.2.15
+            0, 0, 0, 0, 0, 0, // target MAC: zero
+            10, 0, 2, 2, // target IP: 10.0.2.2 (gateway)
+        ];
+        {
+            let (_, mut tx) = dev.split();
+            tx.transmit(&garp);
+        }
+
+        // Now send an ARP request asking "who has 10.0.2.2?"
+        let arp_request: [u8; 42] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // dst: broadcast
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], // src: our MAC
+            0x08, 0x06, // ethertype: ARP
+            0x00, 0x01, // hw type: Ethernet
+            0x08, 0x00, // proto: IPv4
+            0x06, 0x04, // hw/proto size
+            0x00, 0x01, // opcode: request
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], // sender MAC
+            10, 0, 2, 15, // sender IP
+            0, 0, 0, 0, 0, 0, // target MAC: zero (asking)
+            10, 0, 2, 2, // target IP: gateway
+        ];
+        {
+            let (_, mut tx) = dev.split();
+            tx.transmit(&arp_request);
+        }
+
+        // Spin-poll for ARP reply (opcode 0x0002).
+        // Slirp may need time to process, so retry with small delays.
+        let mut got_reply = false;
+        for attempt in 0..200 {
+            // Busy-wait ~1ms between attempts (rough, no timer)
+            if attempt > 0 {
+                for _ in 0..100_000 {
+                    core::hint::spin_loop();
+                }
+            }
+            let (mut rx, _) = dev.split();
+            let is_arp_reply = rx
+                .recv_with(|data| {
+                    if data.len() >= 42 && data[12] == 0x08 && data[13] == 0x06 {
+                        let opcode = u16::from_be_bytes([data[20], data[21]]);
+                        if opcode == 2 {
+                            assert_eq!(
+                                &data[28..32],
+                                &[10, 0, 2, 2],
+                                "ARP reply sender IP should be 10.0.2.2"
+                            );
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .unwrap_or(false);
+            if is_arp_reply {
+                got_reply = true;
+                break;
+            }
+        }
+        assert!(got_reply, "should receive ARP reply from gateway 10.0.2.2");
     }
 }
 

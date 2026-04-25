@@ -60,6 +60,7 @@ pub const TCTL_COLD_SHIFT: u32 = 12;
 pub const RCTL_EN: u32 = 0x00000002;
 pub const RCTL_UPE: u32 = 0x00000008;
 pub const RCTL_MPE: u32 = 0x00000010;
+pub const RCTL_LBM_MAC: u32 = 0x00000040;
 pub const RCTL_BAM: u32 = 0x00008000;
 pub const RCTL_SZ_2048: u32 = 0x00000000;
 pub const RCTL_SECRC: u32 = 0x04000000;

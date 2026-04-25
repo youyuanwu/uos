@@ -10,8 +10,6 @@ mod suites;
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::panic::PanicInfo;
 use embclox_core::mmio_regs::MmioRegs;
-use embclox_e1000::RegisterAccess;
-use embclox_e1000::regs::*;
 use log::*;
 
 const BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -51,7 +49,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let bar0_phys = p.pci.read_bar(&pci_dev, 0);
     let e1000_mmio = p.memory.map_mmio(bar0_phys, 0x20000);
     let regs = MmioRegs::new(e1000_mmio.vaddr());
-    e1000_reset(&regs);
+    embclox_core::e1000_helpers::reset_device(&regs);
     p.pci.enable_bus_mastering(&pci_dev);
 
     let dma = embclox_core::dma_alloc::BootDmaAllocator {
@@ -80,29 +78,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     info!("=== {} passed ===", total);
     harness::qemu_exit(0);
-}
-
-fn e1000_reset(regs: &MmioRegs) {
-    regs.write_reg(IMS, 0);
-    let ctl = regs.read_reg(CTL);
-    regs.write_reg(CTL, ctl | CTL_RST);
-
-    let mut timeout = 100_000u32;
-    loop {
-        if regs.read_reg(CTL) & CTL_RST == 0 {
-            break;
-        }
-        timeout -= 1;
-        assert!(timeout > 0, "e1000 reset timeout");
-    }
-
-    regs.write_reg(IMS, 0);
-    regs.write_reg(CTL, CTL_SLU | CTL_ASDE);
-    regs.write_reg(FCAL, 0);
-    regs.write_reg(FCAH, 0);
-    regs.write_reg(FCT, 0);
-    regs.write_reg(FCTTV, 0);
-    info!("e1000 device reset complete");
 }
 
 #[panic_handler]

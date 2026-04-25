@@ -117,7 +117,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let regs = MmioRegs::new(_e1000_mmio.vaddr());
 
     // Caller performs device reset before new() per driver contract
-    e1000_reset(&regs);
+    embclox_core::e1000_helpers::reset_device(&regs);
     p.pci.enable_bus_mastering(&pci_dev);
 
     // Initialize e1000 driver
@@ -196,32 +196,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         x86_64::instructions::interrupts::disable();
         x86_64::instructions::interrupts::enable_and_hlt();
     }
-}
-
-fn e1000_reset(regs: &MmioRegs) {
-    use embclox_e1000::RegisterAccess;
-    use embclox_e1000::regs::*;
-
-    regs.write_reg(IMS, 0);
-    let ctl = regs.read_reg(CTL);
-    regs.write_reg(CTL, ctl | CTL_RST);
-
-    let mut timeout = 100_000u32;
-    loop {
-        if regs.read_reg(CTL) & CTL_RST == 0 {
-            break;
-        }
-        timeout -= 1;
-        assert!(timeout > 0, "e1000 reset timeout");
-    }
-
-    regs.write_reg(IMS, 0);
-    regs.write_reg(CTL, CTL_SLU | CTL_ASDE);
-    regs.write_reg(FCAL, 0);
-    regs.write_reg(FCAH, 0);
-    regs.write_reg(FCT, 0);
-    regs.write_reg(FCTTV, 0);
-    info!("e1000 device reset complete");
 }
 
 #[embassy_executor::task]
