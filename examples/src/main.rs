@@ -5,21 +5,19 @@
 extern crate alloc;
 extern crate embclox_hal_x86;
 
-mod dma_alloc;
 mod e1000_adapter;
-mod mmio_regs;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicUsize;
-use dma_alloc::BootDmaAllocator;
 use e1000_adapter::E1000Embassy;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
+use embclox_core::dma_alloc::BootDmaAllocator;
+use embclox_core::mmio_regs::MmioRegs;
 use embclox_hal_x86::apic::LocalApic;
 use embclox_hal_x86::ioapic::IoApic;
 use embedded_io_async::Write;
 use log::*;
-use mmio_regs::MmioRegs;
 use static_cell::StaticCell;
 use x86_64::structures::idt::InterruptStackFrame;
 

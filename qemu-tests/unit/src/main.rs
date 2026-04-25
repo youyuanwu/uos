@@ -4,17 +4,15 @@
 extern crate alloc;
 extern crate embclox_hal_x86;
 
-mod dma_alloc;
 mod harness;
-mod mmio_regs;
 mod suites;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::panic::PanicInfo;
+use embclox_core::mmio_regs::MmioRegs;
 use embclox_e1000::RegisterAccess;
 use embclox_e1000::regs::*;
 use log::*;
-use mmio_regs::MmioRegs;
 
 const BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -28,26 +26,31 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut p = embclox_hal_x86::init(boot_info, embclox_hal_x86::Config::default());
     info!("=== embclox test runner ===");
 
-    // --- PCI + e1000 setup ---
+    // --- HAL test context ---
     let pci_dev = p
         .pci
         .find_device_any(0x8086, &[0x100E, 0x100F, 0x10D3])
         .expect("e1000 device not found on PCI bus");
     let bar0_phys = p.pci.read_bar(&pci_dev, 0);
+
+    // --- e1000 test context (needs static for device setup state) ---
     let e1000_vaddr = p.memory.map_mmio(bar0_phys, 0x20000);
     let regs = MmioRegs::new(e1000_vaddr);
-
-    // Device reset
     e1000_reset(&regs);
     p.pci.enable_bus_mastering(&pci_dev);
 
-    // Initialize e1000 test context
     unsafe {
         suites::e1000_smoke::init(regs, p.memory.kernel_offset(), p.memory.phys_offset());
     }
 
-    // --- Run test suites ---
+    // --- Run all test suites ---
     let mut total = 0usize;
+
+    let (name, tests) = suites::hal_pci::suite();
+    total += harness::run_suite(name, tests);
+
+    let (name, tests) = suites::hal_memory::suite();
+    total += harness::run_suite(name, tests);
 
     let (name, tests) = suites::e1000_smoke::suite();
     total += harness::run_suite(name, tests);

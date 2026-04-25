@@ -1,5 +1,5 @@
-use crate::dma_alloc::BootDmaAllocator;
-use crate::mmio_regs::MmioRegs;
+use embclox_core::dma_alloc::BootDmaAllocator;
+use embclox_core::mmio_regs::MmioRegs;
 use embclox_e1000::RegisterAccess;
 use embclox_e1000::regs::*;
 
@@ -34,10 +34,14 @@ fn ctx() -> &'static E1000TestCtx {
     }
 }
 
+/// e1000 driver smoke tests. Requires device setup (reset, bus mastering)
+/// done in main before running. Context is stored in a static because
+/// test functions are `fn()` with no arguments.
 #[embclox_test_macros::test_suite(name = "e1000_smoke")]
 mod tests {
     use super::*;
 
+    /// STATUS register bit 1 (link up) should be set on QEMU's e1000.
     #[test]
     fn status_link_up() {
         let regs = &ctx().regs;
@@ -49,6 +53,7 @@ mod tests {
         );
     }
 
+    /// RAL/RAH registers should contain a non-zero MAC address.
     #[test]
     fn mac_address_nonzero() {
         let regs = &ctx().regs;
@@ -57,6 +62,8 @@ mod tests {
         assert!(ral != 0 || rah != 0, "MAC address should not be zero");
     }
 
+    /// Initialize the device, verify MAC via driver API, split into
+    /// RX/TX halves, confirm no pending RX packets, and transmit a frame.
     #[test]
     fn init_device_and_split() {
         let c = ctx();

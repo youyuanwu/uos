@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+embclox-core.workspace = true
 embclox-e1000.workspace = true
 embclox-hal-x86.workspace = true
 embclox-test-macros.workspace = true

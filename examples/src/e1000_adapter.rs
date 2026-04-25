@@ -3,8 +3,8 @@ use core::task::Context;
 use embassy_net_driver::{Capabilities, HardwareAddress, LinkState};
 use embassy_sync::waitqueue::AtomicWaker;
 
-use crate::dma_alloc::BootDmaAllocator;
-use crate::mmio_regs::MmioRegs;
+use embclox_core::dma_alloc::BootDmaAllocator;
+use embclox_core::mmio_regs::MmioRegs;
 
 type Dev = embclox_e1000::E1000Device<MmioRegs, BootDmaAllocator>;
 

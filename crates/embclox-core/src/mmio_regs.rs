@@ -1,6 +1,9 @@
 use embclox_e1000::RegisterAccess;
 
 /// MMIO register access via UC-mapped volatile pointer.
+///
+/// Wraps a base virtual address (must be UC-mapped) and implements
+/// `RegisterAccess` using volatile reads/writes at word-index offsets.
 #[derive(Clone, Copy)]
 pub struct MmioRegs {
     base: usize,

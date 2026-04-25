@@ -87,3 +87,27 @@ CMakeLists.txt                   # ctest integration (unit + integration)
 2. Use `#[embclox_test_macros::test_suite(name = "my_suite")]`
 3. Add `pub mod my_suite;` to `suites/mod.rs`
 4. Call `run_suite()` with `my_suite::tests::suite()` in `main.rs`
+
+## Test context patterns
+
+Test functions are `fn()` — no arguments. How to pass context depends
+on what the test needs:
+
+- **No context needed**: HAL subsystems like `PciBus` (zero-sized) can
+  be constructed inline. Heap allocator is global after HAL init.
+- **Static context**: e1000 tests need MMIO addresses and DMA offsets
+  from device setup. These are stored in a `static mut Option<Ctx>`
+  initialized once by main before suites run.
+
+### Why e1000 tests use a static
+
+`E1000Device::new()` allocates ~1MB of DMA memory (4 bulk allocations)
+and configures TX/RX rings in device registers. The driver has no
+`Drop` impl or `deinit()` method — creating a device per test would
+leak DMA memory and exhaust the heap. The `map_mmio` call also can't
+be repeated for the same physical address (page already mapped).
+
+To enable per-test init/teardown, the driver would need a `Drop` impl
+that frees DMA regions and resets the device. This is a future
+improvement — for now, e1000 device state is initialized once and
+shared across all tests in the suite.

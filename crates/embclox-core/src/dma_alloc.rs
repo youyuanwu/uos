@@ -1,16 +1,18 @@
-use alloc::alloc::{Layout, alloc_zeroed, dealloc};
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use embclox_e1000::dma::{DmaAllocator, DmaRegion};
 use log::*;
 
 /// DmaAllocator implementation for x86_64 with bootloader offset-mapped memory.
+///
+/// Translates kernel heap addresses to physical addresses for DMA, and
+/// returns virtual addresses through the bootloader's physical memory
+/// mapping so CPU reads are coherent with DMA writes in QEMU TCG mode.
 pub struct BootDmaAllocator {
     /// Offset to convert kernel virtual addresses to physical:
     ///   paddr = kernel_vaddr - kernel_offset
     pub kernel_offset: u64,
     /// Bootloader's physical memory offset:
     ///   phys_mem_vaddr = paddr + phys_offset
-    /// We return vaddr through this mapping so the driver's DMA memory
-    /// accesses go through the same TLB path as QEMU's DMA writes.
     pub phys_offset: u64,
 }
 
@@ -32,7 +34,6 @@ impl DmaAllocator for BootDmaAllocator {
     }
 
     fn free_coherent(&self, region: &DmaRegion) {
-        // Convert phys_offset vaddr back to kernel vaddr for dealloc
         let paddr = region.vaddr - self.phys_offset as usize;
         let heap_vaddr = paddr + self.kernel_offset as usize;
         let layout = Layout::from_size_align(region.size, 4096).unwrap();

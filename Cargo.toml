@@ -5,6 +5,7 @@ members = [
     "tools/embclox-mkimage",
     "examples",
     "qemu-tests/unit",
+    "crates/embclox-core",
     "crates/embclox-e1000",
     "crates/embclox-hal-x86",
     "crates/embclox-test-macros",
@@ -12,6 +13,7 @@ members = [
 
 default-members = [
     "tools/embclox-mkimage",
+    "crates/embclox-core",
     "crates/embclox-e1000",
     "crates/embclox-hal-x86",
     "crates/embclox-test-macros",
@@ -29,6 +31,7 @@ embassy-futures = "0.1"
 embedded-io-async = "0.7"
 
 # Drivers & platform
+embclox-core = { path = "crates/embclox-core" }
 embclox-e1000 = { path = "crates/embclox-e1000" }
 embclox-hal-x86 = { path = "crates/embclox-hal-x86" }
 embclox-test-macros = { path = "crates/embclox-test-macros" }

@@ -297,6 +297,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "embclox-core"
+version = "0.1.0"
+dependencies = [
+ "embclox-e1000",
+ "embclox-hal-x86",
+ "log",
+]
+
+[[package]]
 name = "embclox-e1000"
 version = "0.1.0"
 dependencies = [
@@ -314,6 +323,7 @@ dependencies = [
  "embassy-net-driver",
  "embassy-sync",
  "embassy-time",
+ "embclox-core",
  "embclox-e1000",
  "embclox-hal-x86",
  "embedded-io-async",
@@ -358,6 +368,7 @@ name = "embclox-unit-tests"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
+ "embclox-core",
  "embclox-e1000",
  "embclox-hal-x86",
  "embclox-test-macros",
