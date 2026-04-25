@@ -7,6 +7,7 @@ pub struct MmioRegs {
 }
 
 impl MmioRegs {
+    /// Create a new MmioRegs accessor for the given UC-mapped base address.
     pub fn new(base: usize) -> Self {
         Self { base }
     }

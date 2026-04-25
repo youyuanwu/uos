@@ -5,8 +5,10 @@ const PCI_CONFIG_ADDR: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 const PCI_COMMAND: u8 = 0x04;
 
+/// x86 PCI bus scanner using I/O ports 0xCF8/0xCFC.
 pub struct PciBus;
 
+/// A PCI device found during bus enumeration.
 pub struct PciDevice {
     pub bus: u8,
     pub dev: u8,
@@ -16,6 +18,7 @@ pub struct PciDevice {
 }
 
 impl PciBus {
+    /// Find a PCI device by vendor and device ID on bus 0.
     pub fn find_device(&self, vendor: u16, device_id: u16) -> Option<PciDevice> {
         for dev in 0..32u8 {
             let id = pci_read32(0, dev, 0, 0);
@@ -38,6 +41,7 @@ impl PciBus {
         None
     }
 
+    /// Find a PCI device matching any of the given device IDs.
     pub fn find_device_any(&self, vendor: u16, device_ids: &[u16]) -> Option<PciDevice> {
         for dev in 0..32u8 {
             let id = pci_read32(0, dev, 0, 0);
@@ -60,6 +64,7 @@ impl PciBus {
         None
     }
 
+    /// Enable PCI bus mastering, memory space, and I/O space for a device.
     pub fn enable_bus_mastering(&self, dev: &PciDevice) {
         let cmd = pci_read16(dev.bus, dev.dev, dev.func, PCI_COMMAND);
         pci_write16(dev.bus, dev.dev, dev.func, PCI_COMMAND, cmd | 0x07);
@@ -67,16 +72,19 @@ impl PciBus {
         info!("PCI: bus mastering enabled: cmd={:#06x}", readback);
     }
 
+    /// Read a BAR (Base Address Register) value for a device.
     pub fn read_bar(&self, dev: &PciDevice, bar: u8) -> u64 {
         let offset = 0x10 + bar * 4;
         let raw = pci_read32(dev.bus, dev.dev, dev.func, offset);
         (raw & !0xF) as u64
     }
 
+    /// Read a 32-bit PCI configuration register.
     pub fn read_config(&self, dev: &PciDevice, offset: u8) -> u32 {
         pci_read32(dev.bus, dev.dev, dev.func, offset)
     }
 
+    /// Write a 32-bit PCI configuration register.
     pub fn write_config(&self, dev: &PciDevice, offset: u8, val: u32) {
         pci_write32(dev.bus, dev.dev, dev.func, offset, val);
     }

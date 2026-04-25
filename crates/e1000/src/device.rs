@@ -8,6 +8,7 @@ use core::cmp::min;
 use core::sync::atomic::{fence, Ordering};
 use log::*;
 
+/// Main e1000 device structure. Generic over register access and DMA allocation.
 pub struct E1000Device<R: RegisterAccess, D: DmaAllocator> {
     regs: R,
     dma: D,
@@ -19,11 +20,13 @@ pub struct E1000Device<R: RegisterAccess, D: DmaAllocator> {
     rx: RxRingState,
 }
 
+/// RX half of a split device. Holds shared register access and mutable RX ring state.
 pub struct RxHalf<'a, R: RegisterAccess> {
     regs: &'a R,
     rx: &'a mut RxRingState,
 }
 
+/// TX half of a split device. Holds shared register access and mutable TX ring state.
 pub struct TxHalf<'a, R: RegisterAccess> {
     regs: &'a R,
     tx: &'a mut TxRingState,

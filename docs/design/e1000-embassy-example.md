@@ -27,16 +27,20 @@ async executor and `embassy-net` (smoltcp). Tested via `test.sh`.
 
 ## Key Design Decisions
 
+**Interrupt-driven** — APIC timer (~1ms) for `embassy-time` alarms,
+e1000 RX interrupt via IOAPIC for network wakeup. Executor halts
+(`hlt`) when idle — CPU near-zero when no packets.
+
 **Caller does device reset** — `main.rs` performs CTRL_RST, waits for
 clear, sets SLU|ASDE, disables flow control, re-enables PCI bus
 mastering, then calls `E1000Device::new()`.
 
 **UnsafeCell for Embassy adapter** — Embassy's `Driver::receive()` needs
 both tokens from `&mut self`. Adapter wraps device in `UnsafeCell`, each
-token calls `split()` on consume. Safe: smoltcp consumes sequentially.
+token calls `split()` on consume. ISR only touches `AtomicWaker`.
 
-**Waker re-scheduling** — `cx.waker().wake_by_ref()` on `None` returns
-keeps the `platform-spin` executor polling.
+**AtomicWaker** — `receive()` registers waker via `NET_WAKER.register()`.
+E1000 ISR reads ICR and calls `NET_WAKER.wake()`.
 
 **DMA through `phys_offset`** — QEMU TCG DMA coherency requires
 addresses via the bootloader's physical memory mapping.
@@ -71,8 +75,8 @@ Static IP `10.0.2.15/24`, gateway `10.0.2.2` (QEMU slirp defaults).
 
 ## Future Work
 
-- Interrupt-driven mode (IDT, IOAPIC, APIC timer)
-- DHCP (requires working embassy-time alarms)
+- DHCP (embassy-time alarms now work)
+- `embedded-io-async::Write` for serial (needs interrupt-driven UART)
 
 ## References
 

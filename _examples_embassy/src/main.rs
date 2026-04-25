@@ -1,8 +1,9 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
-extern crate hal_x86; // pulls in critical_section, time_driver, heap, serial/logger
+extern crate hal_x86;
 
 mod dma_alloc;
 mod e1000_adapter;
@@ -10,14 +11,17 @@ mod mmio_regs;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::panic::PanicInfo;
+use core::sync::atomic::AtomicUsize;
 use dma_alloc::BootDmaAllocator;
 use e1000_adapter::E1000Embassy;
-use embassy_executor::Executor;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use embedded_io_async::Write;
+use hal_x86::apic::LocalApic;
+use hal_x86::ioapic::IoApic;
 use log::*;
 use mmio_regs::MmioRegs;
 use static_cell::StaticCell;
+use x86_64::structures::idt::InterruptStackFrame;
 
 const BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -27,11 +31,79 @@ const BOOTLOADER_CONFIG: BootloaderConfig = {
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
+// Global e1000 MMIO base for ISR to read ICR
+static E1000_REGS_BASE: AtomicUsize = AtomicUsize::new(0);
+
+// Global LAPIC pointer for EOI from interrupt handlers
+static mut LAPIC: Option<LocalApic> = None;
+
+fn lapic() -> &'static LocalApic {
+    unsafe {
+        (*core::ptr::addr_of!(LAPIC))
+            .as_ref()
+            .expect("LAPIC not initialized")
+    }
+}
+
+extern "x86-interrupt" fn apic_timer_handler(_frame: InterruptStackFrame) {
+    hal_x86::time::on_timer_tick();
+    lapic().end_of_interrupt();
+}
+
+extern "x86-interrupt" fn e1000_handler(_frame: InterruptStackFrame) {
+    // Acknowledge e1000 interrupt by reading ICR (read-clear register)
+    // Use the global MmioRegs pointer stored at init
+    unsafe {
+        let regs_base = E1000_REGS_BASE.load(core::sync::atomic::Ordering::Relaxed);
+        if regs_base != 0 {
+            // ICR is at word offset 0xC0/4 = 0x30
+            core::ptr::read_volatile((regs_base as *const u32).add(0x000C0 / 4));
+        }
+    }
+    // Wake the network runner task
+    e1000_adapter::NET_WAKER.wake();
+    lapic().end_of_interrupt();
+}
+
+extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
+
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut p = hal_x86::init(boot_info, hal_x86::Config::default());
     info!("Booting e1000-embassy example...");
 
-    // PCI scan for e1000
+    // --- Interrupt infrastructure ---
+    hal_x86::idt::init();
+    hal_x86::pic::disable();
+
+    // Map LAPIC
+    let lapic_vaddr = p.memory.map_mmio(hal_x86::apic::LAPIC_PHYS_BASE, 0x1000);
+    let mut lapic_dev = LocalApic::new(lapic_vaddr);
+    lapic_dev.enable();
+
+    // Calibrate TSC via PIT
+    let tsc_per_us = hal_x86::pit::calibrate_tsc_mhz();
+    hal_x86::time::set_tsc_per_us(tsc_per_us);
+
+    // Register handlers
+    unsafe {
+        hal_x86::idt::set_handler(32, apic_timer_handler);
+        hal_x86::idt::set_handler(39, spurious_handler);
+    }
+
+    // Start APIC timer: periodic, ~1ms intervals
+    // tsc_per_us * 1000 = ticks per ms. Divide by APIC divider (16) for APIC count.
+    let apic_count = (tsc_per_us * 1000 / 16) as u32;
+    lapic_dev.set_timer_periodic(32, 16, apic_count);
+
+    // Store global LAPIC for ISR access
+    unsafe { *core::ptr::addr_of_mut!(LAPIC) = Some(lapic_dev) };
+
+    // Map IOAPIC
+    let ioapic_vaddr = p.memory.map_mmio(hal_x86::ioapic::IOAPIC_PHYS_BASE, 0x1000);
+    let mut ioapic = IoApic::new(ioapic_vaddr);
+    ioapic.log_info();
+
+    // --- PCI + e1000 ---
     let pci_dev = p
         .pci
         .find_device_any(0x8086, &[0x100E, 0x100F, 0x10D3])
@@ -74,6 +146,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     info!("Sent gratuitous ARP");
 
+    // --- E1000 interrupt setup ---
+    // Store MMIO base for ISR
+    E1000_REGS_BASE.store(e1000_vaddr, core::sync::atomic::Ordering::Relaxed);
+
+    // Read e1000 IRQ from PCI interrupt line register
+    let e1000_irq = (p.pci.read_config(&pci_dev, 0x3C) & 0xFF) as u8;
+    info!("e1000 PCI IRQ line: {}", e1000_irq);
+
+    // Register e1000 handler and route via IOAPIC
+    unsafe { hal_x86::idt::set_handler(33, e1000_handler) };
+    ioapic.enable_irq(e1000_irq, 33, 0);
+
+    // Enable e1000 device interrupts
+    e1000_device.enable_interrupts();
+    info!("e1000 interrupts enabled (IRQ {} -> vector 33)", e1000_irq);
+
     let driver = E1000Embassy::new(e1000_device, mac);
 
     // Embassy networking stack with static IP
@@ -90,13 +178,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     static STACK: StaticCell<Stack> = StaticCell::new();
     let stack = &*STACK.init(stack);
 
-    static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-    let executor = EXECUTOR.init(Executor::new());
-    info!("Starting Embassy executor...");
-    executor.run(|spawner| {
-        spawner.spawn(net_task(runner).expect("net_task spawn token"));
-        spawner.spawn(echo_task(stack).expect("echo_task spawn token"));
-    });
+    // Custom executor loop with hlt-on-idle
+    static EXECUTOR: StaticCell<embassy_executor::raw::Executor> = StaticCell::new();
+    let executor = EXECUTOR.init(embassy_executor::raw::Executor::new(core::ptr::null_mut()));
+
+    let spawner = executor.spawner();
+    spawner.spawn(net_task(runner).unwrap());
+    spawner.spawn(echo_task(stack).unwrap());
+
+    info!("Starting executor with hlt-on-idle...");
+    x86_64::instructions::interrupts::enable();
+    loop {
+        unsafe { executor.poll() };
+        // Halt until next interrupt (APIC timer ~1ms or e1000 RX).
+        // cli before hlt prevents race: interrupt between poll() and hlt
+        // would be lost. enable_and_hlt atomically enables + halts.
+        x86_64::instructions::interrupts::disable();
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
 }
 
 fn e1000_reset(regs: &MmioRegs) {

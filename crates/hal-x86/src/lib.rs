@@ -1,11 +1,17 @@
 #![no_std]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
+pub mod apic;
 pub mod critical_section_impl;
 pub mod heap;
+pub mod idt;
+pub mod ioapic;
 pub mod memory;
 pub mod pci;
+pub mod pic;
+pub mod pit;
 pub mod serial;
 pub mod time;
 
@@ -14,6 +20,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// HAL configuration.
 pub struct Config {
     pub serial_port: u16,
     pub heap_size: usize,
@@ -28,6 +35,7 @@ impl Default for Config {
     }
 }
 
+/// Platform peripherals returned by [`init`].
 pub struct Peripherals {
     pub serial: serial::Serial,
     pub pci: pci::PciBus,

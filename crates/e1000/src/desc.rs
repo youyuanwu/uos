@@ -51,27 +51,34 @@ pub struct TxRingState {
 }
 
 impl RxRingState {
+    /// Get a shared reference to the RX descriptor ring.
     pub fn ring(&self) -> &[RxDesc] {
         unsafe { core::slice::from_raw_parts(self.ring_vaddr as *const RxDesc, RX_RING_SIZE) }
     }
+    /// Get a mutable reference to the RX descriptor ring.
     pub fn ring_mut(&mut self) -> &mut [RxDesc] {
         unsafe { core::slice::from_raw_parts_mut(self.ring_vaddr as *mut RxDesc, RX_RING_SIZE) }
     }
+    /// Get the virtual address of the RX buffer at `index`.
     pub fn buf_vaddr(&self, index: usize) -> usize {
         self.bufs_vaddr + index * MBUF_SIZE
     }
+    /// Get the physical address of the RX buffer at `index`.
     pub fn buf_paddr(&self, index: usize) -> usize {
         self.bufs_paddr + index * MBUF_SIZE
     }
 }
 
 impl TxRingState {
+    /// Get a shared reference to the TX descriptor ring.
     pub fn ring(&self) -> &[TxDesc] {
         unsafe { core::slice::from_raw_parts(self.ring_vaddr as *const TxDesc, TX_RING_SIZE) }
     }
+    /// Get a mutable reference to the TX descriptor ring.
     pub fn ring_mut(&mut self) -> &mut [TxDesc] {
         unsafe { core::slice::from_raw_parts_mut(self.ring_vaddr as *mut TxDesc, TX_RING_SIZE) }
     }
+    /// Get the virtual address of the TX buffer at `index`.
     pub fn buf_vaddr(&self, index: usize) -> usize {
         self.bufs_vaddr + index * MBUF_SIZE
     }

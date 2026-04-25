@@ -8,6 +8,8 @@ const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB max
 #[unsafe(link_section = ".bss")]
 static mut HEAP_AREA: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
+/// Initialize the global heap allocator from a BSS-resident array.
+/// Panics if `size` is 0 or exceeds the available heap area.
 pub fn init(size: usize) {
     assert!(size > 0, "heap size must be > 0");
     assert!(size <= HEAP_SIZE, "heap size exceeds HEAP_AREA");
@@ -17,6 +19,7 @@ pub fn init(size: usize) {
     }
 }
 
+/// Get the start address of the heap area (for kernel offset computation).
 pub fn heap_start() -> usize {
     core::ptr::addr_of!(HEAP_AREA) as usize
 }

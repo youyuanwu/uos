@@ -1,23 +1,27 @@
 use core::cell::UnsafeCell;
 use core::task::Context;
 use embassy_net_driver::{Capabilities, HardwareAddress, LinkState};
+use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::dma_alloc::BootDmaAllocator;
 use crate::mmio_regs::MmioRegs;
 
 type Dev = e1000::E1000Device<MmioRegs, BootDmaAllocator>;
 
+/// Waker for the network runner task — signaled from the e1000 ISR.
+pub static NET_WAKER: AtomicWaker = AtomicWaker::new();
+
 pub struct E1000Embassy {
-    // UnsafeCell needed because Driver::receive() returns both RxToken
-    // and TxToken from &mut self. Safe: smoltcp consumes sequentially.
     device: UnsafeCell<Dev>,
     mac: [u8; 6],
 }
 
-// Safety: single-core, no preemption, smoltcp uses tokens sequentially.
+// Safety: single-core. ISR only touches AtomicWaker (not device).
+// Device access via UnsafeCell is only from executor thread.
 unsafe impl Send for E1000Embassy {}
 
 impl E1000Embassy {
+    /// Create a new Embassy adapter wrapping an e1000 device.
     pub fn new(device: Dev, mac: [u8; 6]) -> Self {
         Self {
             device: UnsafeCell::new(device),
@@ -46,7 +50,8 @@ impl embassy_net_driver::Driver for E1000Embassy {
         if rx.has_rx_packet() && tx.has_tx_space() {
             return Some((RxToken { parent: self }, TxToken { parent: self }));
         }
-        cx.waker().wake_by_ref();
+        // Store waker for interrupt-driven wake instead of busy-poll
+        NET_WAKER.register(cx.waker());
         None
     }
 
@@ -55,12 +60,12 @@ impl embassy_net_driver::Driver for E1000Embassy {
         if tx.has_tx_space() {
             return Some(TxToken { parent: self });
         }
-        cx.waker().wake_by_ref();
+        NET_WAKER.register(cx.waker());
         None
     }
 
     fn link_state(&mut self, cx: &mut Context) -> LinkState {
-        cx.waker().wake_by_ref();
+        NET_WAKER.register(cx.waker());
         LinkState::Up
     }
 
@@ -75,6 +80,7 @@ impl embassy_net_driver::Driver for E1000Embassy {
     }
 }
 
+/// Embassy RX token — consumes one received packet via `recv_with`.
 pub struct RxToken<'a> {
     parent: &'a E1000Embassy,
 }
@@ -86,6 +92,7 @@ impl<'a> embassy_net_driver::RxToken for RxToken<'a> {
     }
 }
 
+/// Embassy TX token — transmits one packet via `transmit_with`.
 pub struct TxToken<'a> {
     parent: &'a E1000Embassy,
 }

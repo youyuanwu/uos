@@ -5,6 +5,7 @@ use x86_64::{PhysAddr, VirtAddr};
 
 const MMIO_VIRT_BASE: u64 = 0x4000_0000_0000;
 
+/// Physical memory mapper for MMIO and virtual/physical address translation.
 pub struct MemoryMapper {
     phys_offset: u64,
     kernel_offset: u64,
@@ -12,6 +13,7 @@ pub struct MemoryMapper {
 }
 
 impl MemoryMapper {
+    /// Create a new memory mapper with bootloader-provided offsets.
     pub fn new(phys_offset: u64, kernel_offset: u64) -> Self {
         Self {
             phys_offset,
@@ -20,10 +22,12 @@ impl MemoryMapper {
         }
     }
 
+    /// Bootloader's physical memory mapping offset.
     pub fn phys_offset(&self) -> u64 {
         self.phys_offset
     }
 
+    /// Kernel virtual-to-physical address offset.
     pub fn kernel_offset(&self) -> u64 {
         self.kernel_offset
     }
