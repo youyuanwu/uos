@@ -48,8 +48,8 @@ jobs:
           cargo run -p embclox-mkimage -- target/x86_64-unknown-none/debug/embclox-example target/x86_64-unknown-none/debug/embclox-example.img
           cargo run -p embclox-mkimage -- target/x86_64-unknown-none/debug/embclox-unit-tests target/x86_64-unknown-none/debug/embclox-unit-tests.img
 
-      - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 netcat-openbsd
+      - name: Install QEMU and OVMF
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf netcat-openbsd
 
       - name: QEMU tests
         run: cmake -B build && ctest --test-dir build --output-on-failure

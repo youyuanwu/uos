@@ -82,12 +82,26 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Build QEMU command ---
+# Use UEFI boot via OVMF firmware
+OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
+OVMF_VARS="/usr/share/OVMF/OVMF_VARS_4M.fd"
+
+if [[ ! -f "$OVMF_CODE" ]]; then
+    die "OVMF not found: $OVMF_CODE (install with: sudo apt install ovmf)"
+fi
+
+# Copy VARS file so QEMU can write to it without modifying the system file
+OVMF_VARS_COPY="${LOG%.log}-ovmf-vars.fd"
+cp "$OVMF_VARS" "$OVMF_VARS_COPY"
+
 QEMU_CMD=(
     qemu-system-x86_64
     -machine q35
     -no-reboot
     -serial "file:$LOG"
     -display none
+    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
+    -drive "if=pflash,format=raw,file=$OVMF_VARS_COPY"
     -drive "format=raw,file=$IMAGE"
     -device "isa-debug-exit,iobase=0xf4,iosize=0x04"
 )

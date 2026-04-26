@@ -38,9 +38,11 @@ add_custom_command(
     COMMAND cargo run -p embclox-mkimage -- ${KERNEL_REL} ${IMAGE_REL}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     DEPENDS example-build
-    COMMENT "Creating BIOS disk image"
+    COMMENT "Creating UEFI disk image"
 )
 add_custom_target(example-image DEPENDS ${IMAGE_ABS})
+
+set(OVMF_CODE "/usr/share/OVMF/OVMF_CODE_4M.fd")
 
 add_custom_target(qemu
     COMMAND qemu-system-x86_64
@@ -48,11 +50,12 @@ add_custom_target(qemu
         -no-reboot
         -serial mon:stdio
         -display none
+        -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}
         -drive format=raw,file=${IMAGE_ABS}
         -netdev user,id=net0,hostfwd=tcp::5555-:1234
         -device e1000,netdev=net0
     DEPENDS example-image
-    COMMENT "Running QEMU"
+    COMMENT "Running QEMU (UEFI)"
 )
 
 set(UNIT_KERNEL_REL "target/${TARGET}/${MODE}/embclox-unit-tests")
@@ -70,7 +73,7 @@ add_custom_command(
     COMMAND cargo run -p embclox-mkimage -- ${UNIT_KERNEL_REL} ${UNIT_IMAGE_REL}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     DEPENDS unit-test-build
-    COMMENT "Creating unit test disk image"
+    COMMENT "Creating unit test UEFI disk image"
 )
 add_custom_target(unit-test-image DEPENDS ${UNIT_IMAGE_ABS})
 

@@ -14,21 +14,26 @@ need a NetVSC (Network Virtual Service Client) driver.
 
 ## Architecture Overview
 
-The Hyper-V networking stack has 4 layers, each of which must be implemented:
+The Hyper-V networking stack has **5 layers**, each of which must be implemented:
 
 ```
 ┌────────────────────────────────────────────────┐
 │  embassy-net / smoltcp  (existing)             │
 ├────────────────────────────────────────────────┤
-│  NetVSC driver  (RNDIS protocol)               │
-│  Send: RNDIS_PACKET → VMBus ring               │
-│  Recv: VMBus ring → RNDIS_PACKET → frame       │
+│  NetVSC driver  (embassy adapter)              │
+├────────────────────────────────────────────────┤
+│  RNDIS protocol  (frame encapsulation)         │
+│  Send: RNDIS_PACKET → NVSP → VMBus ring        │
+│  Recv: VMBus ring → NVSP → RNDIS → frame        │
+├────────────────────────────────────────────────┤
+│  NVSP  (Network VSP protocol)                   │
+│  Version negotiation, shared buffer setup       │
 ├────────────────────────────────────────────────┤
 │  VMBus transport  (ring buffers, channels)      │
 │  Channel offer/open, GPADL, sendpacket/recvpkt  │
 ├────────────────────────────────────────────────┤
 │  Hyper-V hypercall layer  (MSRs, SynIC)         │
-│  wrmsr, vmcall/vmmcall, synthetic interrupts    │
+│  CPUID detect, wrmsr, hypercall page, SynIC     │
 ├────────────────────────────────────────────────┤
 │  Hardware  (Hyper-V hypervisor)                  │
 └────────────────────────────────────────────────┘
@@ -39,7 +44,7 @@ of glue):
 
 | | e1000 | virtio-net | hv_netvsc |
 |---|---|---|---|
-| Layers | 1 (MMIO regs) | 1 (wrap crate) | 4 (hypercall → VMBus → RNDIS → NetVSC) |
+| Layers | 1 (MMIO regs) | 1 (wrap crate) | 5 (hypercall → VMBus → NVSP → RNDIS → NetVSC) |
 | Transport | PCI MMIO | PCI virtqueue | VMBus (hypercalls + shared memory) |
 | Interrupt | IOAPIC / INTx | IOAPIC / MSI-X | SynIC (synthetic interrupt controller) |
 | Existing crate | None (custom) | `virtio-drivers` ✅ | None ❌ |
@@ -62,11 +67,19 @@ The guest communicates with Hyper-V via MSRs and the `vmcall` instruction.
 
 ### Init Sequence
 
+0. Detect Hyper-V via CPUID leaf `0x40000000` ("Microsoft Hv" signature).
+   If not present, return `Err(HypervisorNotPresent)` — MSR writes on
+   non-Hyper-V platforms cause #GP(0) faults.
 1. Write `HV_X64_MSR_GUEST_OS_ID` to identify as a guest
-2. Allocate a page, write GPA to `HV_X64_MSR_HYPERCALL` to set up hypercall page
+2. Allocate a page for hypercall code, write GPA to `HV_X64_MSR_HYPERCALL`.
+   The page must be mapped with **execute** permissions (RX) — the HAL's
+   `map_mmio` creates RW-only mappings, so a new `map_executable` or
+   explicit page table flags will be needed.
 3. Enable SynIC via `HV_X64_MSR_SCONTROL`
 4. Allocate message + event pages, write GPAs to `SIMP`/`SIEFP`
-5. Configure SINT vectors (map to IDT vectors for interrupt delivery)
+5. Configure SINT vectors (map to IDT vectors for interrupt delivery).
+   Vectors must not collide with existing IOAPIC vectors (32+ for APIC
+   timer, 33 for e1000). Use a dedicated range (e.g., 48–63).
 
 ### Key Hypercalls
 
@@ -77,7 +90,8 @@ The guest communicates with Hyper-V via MSRs and the `vmcall` instruction.
 
 Hypercalls are issued via the hypercall page (not direct `vmcall`).
 
-**Estimated LOC**: ~300 (MSR wrappers, hypercall page setup, SynIC init)
+**Estimated LOC**: ~400 (MSR wrappers, CPUID detection, hypercall page
+setup with RX mapping, SynIC init, error handling)
 
 ## Layer 2: VMBus Transport
 
@@ -118,21 +132,86 @@ struct HvRingBuffer {
 
 Messages are 8-byte aligned with a 16-byte header per packet.
 
+**Ring buffer invariants** (must enforce defensively):
+- `0 <= read_index, write_index < buffer_size` — bounds-check all
+  host-written indices before use to prevent UB
+- Wrap-around: messages may span the buffer boundary; split reads/writes
+  must handle the wrap point correctly
+- Backpressure: when TX ring is full, return `WouldBlock` — do not spin
+- ISR scope: the SynIC ISR must only call `AtomicWaker::wake()` — ring
+  buffer reads happen in executor context to avoid data races on
+  shared header fields (`read_index`, `write_index`)
+
 ### GPADL (Guest Physical Address Descriptor List)
 
 GPADL shares guest physical pages with the host. The guest sends a list
 of PFNs (Page Frame Numbers), the host maps them, and returns a handle
 used in subsequent operations.
 
-**Estimated LOC**: ~800 (channel management, ring buffer read/write,
-GPADL creation, message parsing)
+**GPADL lifecycle constraints**:
+- Teardown ordering: close channel → revoke GPADL → free DMA. Rust
+  `Drop` order (reverse field declaration) must enforce this.
+- If the host rejects GPADL creation, the guest must free the allocated
+  DMA memory and return an error (not panic).
+- The current `DmaAllocator` returns a single contiguous `paddr`. GPADL
+  requires per-page PFNs. Verify that heap allocations from
+  `BootDmaAllocator` are physically contiguous under bootloader v0.11,
+  or extend the trait to expose `page_pfns()`.
 
-## Layer 3: RNDIS Protocol
+### Channel Offer Handling
+
+The guest waits for the host to deliver channel offers via the SynIC
+message page. **Timeout is mandatory**: use a bounded poll loop
+(e.g., 5 seconds) to avoid hanging indefinitely if no offer arrives
+(misconfigured VM, SynIC init failure). Log all received offer GUIDs
+before filtering for the NetVSC GUID.
+
+**Estimated LOC**: ~1000 (channel management, ring buffer read/write
+with bounds checks and wrap-around, GPADL creation/teardown, message
+parsing, timeout/error handling)
+
+## Layer 3: NVSP (Network VSP Protocol)
+
+NVSP sits between VMBus and RNDIS. It handles version negotiation and
+shared buffer establishment — RNDIS messages cannot be exchanged without
+prior NVSP setup.
+
+### NVSP Init Sequence
+
+1. Send `NVSP_MSG_TYPE_INIT` with supported version (typically v4 or v5)
+2. Receive `NVSP_MSG_TYPE_INIT_COMPLETE` with accepted version
+3. Send `NVSP_MSG1_TYPE_SEND_RECV_BUF` — establish shared receive buffer
+   via GPADL (typically ~2 MiB)
+4. Receive `NVSP_MSG1_TYPE_SEND_RECV_BUF_COMPLETE` — host confirms
+   buffer sections
+5. Send `NVSP_MSG1_TYPE_SEND_SEND_BUF` — establish shared send buffer
+   via GPADL (typically ~1 MiB)
+6. Receive `NVSP_MSG1_TYPE_SEND_SEND_BUF_COMPLETE`
+
+### Data Path
+
+RNDIS packets are wrapped in `NVSP_MSG1_TYPE_SEND_RNDIS_PKT` for TX
+and delivered via `NVSP_MSG1_TYPE_SEND_RNDIS_PKT_COMPLETE` for RX.
+The NVSP layer also handles transfer page ranges that reference
+offsets within the shared receive buffer.
+
+**Memory budget**: NVSP shared buffers consume ~3 MiB (2 MiB receive +
+1 MiB send). With the current 4 MiB heap, this leaves ~1 MiB for
+kernel, Embassy, smoltcp, and ring buffers. Buffer sizes are
+negotiable — smaller buffers trade throughput for memory. Document
+the trade-off and consider increasing heap to 8 MiB.
+
+**Estimated LOC**: ~300 (version negotiation, buffer setup, RNDIS
+message wrapping/unwrapping)
+
+## Layer 4: RNDIS Protocol
 
 NetVSC uses RNDIS (Remote NDIS) — Microsoft's protocol for encapsulating
 network frames over an abstract transport.
 
 ### Message Types
+
+**Required** (minimum viable):
 
 | Message | Type Code | Direction | Purpose |
 |---------|-----------|-----------|---------|
@@ -141,7 +220,21 @@ network frames over an abstract transport.
 | `RNDIS_QUERY_MSG` | `0x00000004` | Guest → Host | Query OIDs (MAC, etc.) |
 | `RNDIS_QUERY_CMPLT` | `0x80000004` | Host → Guest | Query response |
 | `RNDIS_SET_MSG` | `0x00000005` | Guest → Host | Set config (filters) |
+| `RNDIS_SET_CMPLT` | `0x80000005` | Host → Guest | Set response |
 | `RNDIS_PACKET_MSG` | `0x00000001` | Both | Data packet (Ethernet frame) |
+| `RNDIS_KEEPALIVE_MSG` | `0x00000008` | Host → Guest | Keepalive (must respond) |
+| `RNDIS_KEEPALIVE_CMPLT` | `0x80000008` | Guest → Host | Keepalive response |
+
+**Handle but defer** (log and ignore):
+
+| Message | Purpose |
+|---------|---------|
+| `RNDIS_INDICATE_STATUS_MSG` | Link status changes, media events |
+| `RNDIS_RESET_MSG` | Host-initiated reset |
+
+Each request/response is correlated by `request_id`. The guest must
+track pending request IDs to match responses. RNDIS version is
+typically 1.0 (`major=1, minor=0`).
 
 ### Data Flow
 
@@ -153,17 +246,22 @@ strip RNDIS header → Ethernet frame
 
 ### RNDIS Init Sequence
 
-1. Send `RNDIS_INITIALIZE_MSG` (version, max transfer size)
-2. Receive `RNDIS_INITIALIZE_CMPLT` (status, capabilities)
+Each step can fail independently — version mismatch, timeout, unexpected
+message type, or OID query failure. Each step must have a timeout and
+return a descriptive error on failure.
+
+1. Send `RNDIS_INITIALIZE_MSG` (version 1.0, max transfer size)
+2. Receive `RNDIS_INITIALIZE_CMPLT` — check status field, verify version
 3. Query `OID_802_3_PERMANENT_ADDRESS` → get MAC address
 4. Query `OID_GEN_MAXIMUM_FRAME_SIZE` → get MTU
 5. Set `OID_GEN_CURRENT_PACKET_FILTER` → enable receive
 6. Ready to send/receive `RNDIS_PACKET_MSG`
 
-**Estimated LOC**: ~600 (message types, init handshake, OID queries,
-packet wrap/unwrap)
+**Estimated LOC**: ~800 (message types with full set, init handshake with
+error handling, OID queries, keepalive, request ID correlation, packet
+wrap/unwrap)
 
-## Layer 4: NetVSC / Embassy Adapter
+## Layer 5: NetVSC / Embassy Adapter
 
 Thin layer that ties RNDIS to `embassy_net_driver::Driver`, following the
 same pattern as `e1000_embassy.rs`.
@@ -189,7 +287,8 @@ The primary reference for porting is the Linux kernel:
 
 Not all of this needs porting — many Linux abstractions (workqueues,
 netdev, NAPI) don't apply to bare-metal. Realistic port estimate is
-~1800–2500 LOC of new Rust code.
+**~2500–3500 LOC** of new Rust code (including NVSP layer, error
+handling, bounds checks, and CPUID/MSR infrastructure).
 
 ## Comparison: Effort vs. Alternatives
 
@@ -197,36 +296,53 @@ netdev, NAPI) don't apply to bare-metal. Realistic port estimate is
 |----------|----------|-------------|---------|
 | **e1000** (done) | 620 LOC | None needed | QEMU ✅ |
 | **virtio-net** | ~200 LOC glue | `virtio-drivers` | QEMU ✅ |
-| **hv_netvsc** | ~1800-2500 LOC | None available | Hyper-V only ❌ |
+| **hv_netvsc** | ~2500-3500 LOC | None available | Hyper-V only ❌ |
 
 ## Crate Structure
 
+### Prerequisite: Extract `DmaAllocator` trait
+
+The `DmaAllocator` and `DmaRegion` types are currently defined in
+`embclox-e1000::dma`. Both `embclox-hyperv` and any future driver need
+them, but depending on `embclox-e1000` from `embclox-hyperv` is
+architecturally wrong (cross-driver dependency). **Move to
+`embclox-core`** before implementation begins — it already holds the
+`BootDmaAllocator` implementation and `MmioRegs`, so the trait belongs
+alongside its primary consumer.
+
+### Module Layout
+
 ```
 crates/
-├── embclox-hyperv/             (new — ~1200 LOC)
+├── embclox-hyperv/             (new — ~1700 LOC)
 │   ├── src/
 │   │   ├── lib.rs
-│   │   ├── hypercall.rs        # MSR wrappers, hypercall page
+│   │   ├── detect.rs           # CPUID 0x40000000 hypervisor detection
+│   │   ├── hypercall.rs        # MSR wrappers, hypercall page (RX mapping)
 │   │   ├── synic.rs            # SynIC init, SINT vectors
-│   │   ├── vmbus.rs            # Channel lifecycle, GPADL
-│   │   ├── ring_buffer.rs      # Ring buffer read/write
+│   │   ├── vmbus.rs            # Channel lifecycle, GPADL, offer timeout
+│   │   ├── ring_buffer.rs      # Ring buffer with bounds checks, wrap-around
+│   │   ├── nvsp.rs             # NVSP version negotiation, shared buffers
 │   │   └── message.rs          # VMBus message types
 │   └── Cargo.toml
-├── embclox-netvsc/             (new — ~800 LOC)
+├── embclox-netvsc/             (new — ~1000 LOC)
 │   ├── src/
 │   │   ├── lib.rs
-│   │   ├── rndis.rs            # RNDIS message types + init
+│   │   ├── rndis.rs            # RNDIS message types, keepalive, request ID
 │   │   ├── device.rs           # NetVSC device (send/recv)
 │   │   └── oid.rs              # OID constants + query helpers
 │   └── Cargo.toml
 ├── embclox-core/
 │   ├── src/
+│   │   ├── dma.rs              # DmaAllocator trait, DmaRegion (moved from e1000)
+│   │   ├── dma_alloc.rs        # BootDmaAllocator (existing)
 │   │   ├── e1000_embassy.rs    (existing)
 │   │   ├── virtio_embassy.rs   (future)
 │   │   ├── netvsc_embassy.rs   (new — ~150 LOC)
 │   │   └── ...
 │   └── Cargo.toml
-└── embclox-hal-x86/            (existing — extend for SynIC)
+├── embclox-e1000/              (existing — re-export from embclox-core::dma)
+└── embclox-hal-x86/            (existing — extend for SynIC, MSR, RX mapping)
 ```
 
 Two separate crates because `embclox-hyperv` (VMBus transport) is reusable
@@ -236,14 +352,14 @@ for future Hyper-V devices (storvsc for disk, kvp for key-value pairs).
 
 | Abstraction | Reusable? | Notes |
 |-------------|-----------|-------|
-| `DmaAllocator` trait | ✅ | Ring buffers + GPADL need coherent DMA |
+| `DmaAllocator` trait | ✅ | **Move to `embclox-core`** from `embclox-e1000` first |
 | `BootDmaAllocator` | ✅ | Same heap-based allocation |
 | Embassy adapter pattern | ✅ | Same `Driver` trait impl |
-| `AtomicWaker` | ✅ | SynIC interrupt → wake executor |
-| PCI discovery | ❌ | VMBus uses ACPI, not PCI |
+| `AtomicWaker` | ✅ | SynIC interrupt → wake executor (ISR only wakes, no ring access) |
+| PCI discovery | ❌ | VMBus uses ACPI/offers, not PCI |
 | `MmioRegs` / `RegisterAccess` | ❌ | VMBus uses ring buffers, not MMIO |
-| IOAPIC routing | ❌ | SynIC replaces IOAPIC for VMBus devices |
-| `MemoryMapper::map_mmio` | ❌ | No MMIO BARs for synthetic devices |
+| IOAPIC routing | ❌ | SynIC replaces IOAPIC (vectors must not collide) |
+| `MemoryMapper::map_mmio` | ⚠️ | May need `map_executable` for hypercall page |
 
 **Key difference**: VMBus devices are **not PCI devices**. They are
 discovered via ACPI (or the VMBus offer protocol), not PCI enumeration.
@@ -302,12 +418,13 @@ Remove-Item $VHD
 
 | Concern | Detail |
 |---------|--------|
-| **VM generation** | Must use Gen1 (BIOS boot). Gen2 is UEFI only. |
-| **COM port** | Gen1 only — serial output via named pipe `\\.\pipe\<name>` |
-| **Exit code** | No `isa-debug-exit` — must parse serial log for PASS/FAIL markers |
-| **Disk format** | Hyper-V needs VHD, not raw. One `qemu-img convert` step. |
-| **Network** | "Default Switch" provides NAT (like QEMU slirp) for ARP/DHCP tests |
-| **Platform** | Requires Windows with Hyper-V enabled — cannot run on Linux |
+| **VM generation** | Must use **Gen2** (UEFI boot). Gen1 hangs due to VBE. |
+| **Secure Boot** | Must disable — our bootloader is not signed. |
+| **Debug output** | No COM port — use framebuffer text rendering. |
+| **Exit code** | No `isa-debug-exit` — must parse framebuffer or use test markers. |
+| **Disk format** | Hyper-V needs VHD/VHDX. `qemu-img convert -f raw -O vpc`. |
+| **Network** | "Default Switch" provides NAT for ARP/DHCP tests. |
+| **Platform** | Requires Windows with Hyper-V enabled — cannot run on Linux. |
 
 ### CI: GitHub Actions
 
@@ -373,24 +490,80 @@ understanding what hardware Azure exposes vs. local Hyper-V.
 | **Synthetic NIC** | Optional (needs netvsc) | **Only option** (needs netvsc) | Only option (needs netvsc) |
 | **Synthetic disk** | Optional (needs storvsc) | Optional (IDE suffices for boot) | **Required** (no IDE) |
 
-### Why Gen2 Is Not Viable (Currently)
+### Why Gen1 Is Not Viable
 
-Gen2 VMs have three blockers:
+Gen1 VMs use BIOS boot, but `bootloader` v0.11's BIOS stage
+unconditionally attempts VBE (VESA BIOS Extensions) framebuffer setup.
+Hyper-V's virtual BIOS does not implement VBE, causing a hang before
+the kernel starts. This is a known upstream issue (bootloader GitHub
+issues #575, #222). Tested 2026-04-25.
 
-1. **UEFI boot** — our bootloader v0.11 uses `create_bios_image`. We'd
-   need `create_uefi_image` (the bootloader crate supports this, but
-   our `embclox-mkimage` tool is not set up for it).
-2. **SCSI boot** — no IDE controller exists in Gen2. The VM cannot boot
-   without a storvsc driver, even though our kernel runs from RAM after
-   boot. The bootloader itself needs to read the disk.
-3. **No COM port** — Gen2 has no serial ports at all. Our entire serial
-   output and test infrastructure depends on COM1 (port 0x3F8). We'd
-   need a Hyper-V synthetic console (VMBus-based) or EFI console output.
+### Gen2 Is the Target
 
-**Gen1 is the right target.** It gives us BIOS boot (works today), IDE
-disk (no driver needed for our RAM-only kernel), and COM1 serial
-(existing infrastructure). The only missing piece is netvsc for
-networking.
+Gen2 uses UEFI firmware, which `bootloader` v0.11 supports via
+`create_uefi_image()`. UEFI boot avoids VBE entirely.
+
+**Gen2 requirements vs current state**:
+
+| Requirement | Current State | Action Needed |
+|-------------|--------------|---------------|
+| UEFI boot image | `create_bios_image` only | Add `create_uefi_image` to `embclox-mkimage` |
+| Disk format | VHD (raw→vpc) | VHDX preferred for Gen2, VHD also works |
+| Boot disk | SCSI (storvsc) | **Not needed** — UEFI loads kernel+initrd to RAM, our kernel never accesses disk after boot |
+| Serial output | COM1 (0x3F8) | ❌ No COM port on Gen2 — need alternative |
+| Debug output | Named pipe | Use UEFI console (visible in VM Connect) or Hyper-V KVP/network logging |
+| Secure Boot | Enabled by default | Must disable (our bootloader is not signed) |
+| Network | Synthetic NIC only | Same as Gen1 — needs netvsc |
+
+### Serial Output on Gen2
+
+Gen2 VMs have **no COM ports**. Options for debug output:
+
+1. **UEFI console output** — visible in the VM Connect window during
+   boot. The `bootloader` crate's UEFI stage uses EFI console services,
+   so bootloader messages appear. After kernel handoff, we'd need to
+   write to the EFI framebuffer (which `bootloader` v0.11 maps for us).
+
+2. **Hyper-V synthetic serial (VMBus)** — requires netvsc-like VMBus
+   driver for a synthetic COM port. Chicken-and-egg problem: need the
+   driver we're trying to debug.
+
+3. **Framebuffer text rendering** — write directly to the UEFI
+   framebuffer that `bootloader` provides. Simple bitmap font renderer,
+   ~200 LOC. This works for all output without VMBus.
+
+4. **Keep COM port for QEMU** — our serial driver still works on QEMU.
+   Use framebuffer output on Hyper-V, serial on QEMU. Feature-gate
+   or auto-detect at runtime.
+
+**Recommended**: Option 3 (framebuffer text) + option 4 (keep serial
+for QEMU). The framebuffer is always available on both platforms.
+
+### Hyper-V Test Script Changes
+
+The `scripts/hyperv-boot-test.ps1` must be updated for Gen2:
+
+```powershell
+# Gen2 VM creation
+New-VM -Name $VMName -Generation 2 -MemoryStartupBytes 256MB -NoVHD
+Add-VMHardDiskDrive -VMName $VMName -Path $vhdPath
+# Disable Secure Boot (unsigned bootloader)
+Set-VMFirmware -VMName $VMName -EnableSecureBoot Off
+# No COM port — capture output via VM Connect screenshot or
+# framebuffer text visible in the VM Connect window
+```
+
+### Full Driver Matrix (Updated)
+
+| Target | Boot | Debug Output | Network | Disk |
+|--------|------|-------------|---------|------|
+| **QEMU** | bootloader BIOS | ✅ COM1 serial | e1000 ✅ / virtio-net (future) | N/A (RAM) |
+| **Hyper-V Gen2** | bootloader UEFI | Framebuffer text | netvsc | N/A (RAM) |
+| **Azure Gen2** | bootloader UEFI | Azure Serial Console* | netvsc | N/A (RAM) |
+| **GCP** | bootloader | ✅ serial | virtio-net | N/A (RAM) |
+
+\* Azure may provide serial console access even for Gen2 via its
+diagnostics infrastructure — needs verification.
 
 **Key insight**: Our kernel doesn't need a disk driver at all after boot.
 The bootloader (BIOS, IDE) loads the kernel into RAM, then our kernel runs
@@ -425,42 +598,75 @@ Boot diagnostics must be enabled on the VM for serial console access:
 az vm boot-diagnostics enable --name embclox-test --resource-group rg
 ```
 
-### Mock Testing (No Hypervisor)
+### Mock Testing (embclox-tests crate)
 
-For unit-testing the VMBus ring buffer logic and RNDIS message
-serialization without a real Hyper-V host, we can write `#[cfg(test)]`
-tests in the `embclox-hyperv` crate that exercise the protocol parsing
-and ring buffer algorithms against mock memory. This runs on any platform
-including Linux CI.
+Pure-logic tests (ring buffer, RNDIS parsing, NVSP state machine) run
+in a standard `embclox-tests` crate that uses the Rust `std` library.
+This avoids `no_std`/`#[cfg(test)]` limitations and runs via regular
+`cargo test` on any platform including Linux CI.
+
+**Specific test coverage**:
+- Ring buffer: write/read with wrap-around, full buffer backpressure,
+  corrupt index detection, 8-byte alignment enforcement
+- RNDIS: message serialization/deserialization round-trips, keepalive
+  response generation, request ID correlation
+- NVSP: version negotiation state machine, buffer setup message format
+- VMBus: GPADL PFN list construction, channel offer GUID matching
+
+The `embclox-hyperv` and `embclox-netvsc` crates should design their
+ring buffer and protocol modules to operate on `&[u8]` slices, making
+them testable from `embclox-tests` without any hardware or hypervisor.
+
+### Gen2 VM Diagnostic
+
+If a developer accidentally creates a Gen2 VM, the result is complete
+silence — no boot, no serial, no error. The `hyperv-test.ps1` script
+must validate `Generation -eq 1` and print a clear error if Gen2 is
+detected. The doc should note the symptom: "no serial output from
+Hyper-V VM → check VM generation (must be Gen1)."
 
 ## Implementation Phases
 
-### Phase 0: Prerequisites
+### Phase 0: Prerequisites (Go/No-Go Gate)
 
 - Understand Hyper-V TLFS (Top Level Functional Specification)
-- Set up local Hyper-V VM for testing with serial output
-- Verify embclox bootloader works under Hyper-V
+- **UEFI boot**: Add `create_uefi_image` support to `embclox-mkimage`.
+  Build UEFI image → convert to VHD → boot in Gen2 Hyper-V VM with
+  Secure Boot disabled → verify output appears in VM Connect window.
+  **This is a hard gate.**
+- **Framebuffer text output**: Implement basic framebuffer text renderer
+  (~200 LOC) using the bootloader-provided framebuffer. Needed because
+  Gen2 has no COM port.
+- Extract `DmaAllocator` trait from `embclox-e1000` to `embclox-core`
+- Add `map_executable` (RX page mapping) to HAL if needed for
+  hypercall page
 
 ### Phase 1: Hypercall + SynIC Foundation
 
-- MSR read/write wrappers
-- Hypercall page allocation and setup
+- CPUID `0x40000000` hypervisor detection
+- MSR read/write wrappers (via `x86_64` crate `Msr::read()/write()`)
+- Hypercall page allocation and setup (with RX mapping)
 - SynIC initialization (message page, event page, SINT vectors)
+- Spike: do channel offers arrive without ACPI? If not, evaluate `acpi`
+  crate for `no_std`.
 - Verify: guest OS ID registered, SynIC enabled
 
 ### Phase 2: VMBus Transport
 
-- Handle channel offers from host
-- GPADL creation (share ring buffer memory with host)
-- Channel open/close
-- Ring buffer read/write primitives
+- Handle channel offers from host (with timeout)
+- GPADL creation (share ring buffer memory with host, per-page PFNs)
+- Channel open/close with cleanup on failure
+- Ring buffer read/write with bounds checks and wrap-around handling
 - Verify: channel opened, can send/receive VMBus messages
 
-### Phase 3: RNDIS + NetVSC
+### Phase 3: NVSP + RNDIS + NetVSC
 
-- RNDIS init handshake
+- NVSP version negotiation
+- Shared receive/send buffer setup via GPADL
+- RNDIS init handshake with error handling per step
 - OID queries (MAC address, MTU)
-- Packet send/receive (RNDIS_PACKET_MSG wrap/unwrap)
+- Packet send/receive (NVSP → RNDIS_PACKET_MSG wrap/unwrap)
+- Keepalive response
 - Verify: ARP round-trip with Hyper-V virtual switch
 
 ### Phase 4: Embassy Integration
@@ -471,17 +677,23 @@ including Linux CI.
 
 ## Open Questions
 
-1. **Bootloader compatibility**: Does `bootloader` v0.11 work under
-   Hyper-V? Hyper-V Gen1 uses BIOS, Gen2 uses UEFI. Our current
-   bootloader targets BIOS.
+1. **Bootloader UEFI boot** (Phase 0): `bootloader` v0.11 supports
+   `create_uefi_image()`. Need to add this to `embclox-mkimage`, build
+   a UEFI image, and test on a Gen2 VM with Secure Boot disabled.
+   Gen1 BIOS boot is blocked by VBE hang (bootloader #575, #222).
 
-2. **ACPI dependency**: VMBus device discovery may require ACPI table
-   parsing. Do we need an ACPI parser, or can we hardcode the well-known
-   NetVSC GUID (`f8615163-df3e-46c5-913f-f2d2f965ed0e`)?
+2. **ACPI dependency** (Phase 1 spike): VMBus channel offers may arrive
+   via SynIC without ACPI, or ACPI may be required for VMBus connection
+   address discovery. Spike on real Hyper-V during Phase 1. If ACPI is
+   needed, evaluate the `acpi` crate (`no_std` compatible).
 
-3. **OpenVMM reference**: Microsoft's OpenVMM (Rust, MIT-licensed) has
-   VMBus code, but it's the **host** side. The guest-side protocol is
-   the mirror image — useful as reference but not directly portable.
+3. **Heap sizing**: NVSP shared buffers need ~3 MiB. Current heap is
+   4 MiB. May need to increase to 8 MiB, or negotiate smaller NVSP
+   buffers (trade throughput for memory).
+
+4. **OpenVMM reference**: Microsoft's OpenVMM (Rust, MIT-licensed) has
+   VMBus code, but it's the **host** side. The `protocol.rs` wire
+   format structs are useful reference for porting to `no_std`.
 
 ## OpenVMM Crate Analysis
 
