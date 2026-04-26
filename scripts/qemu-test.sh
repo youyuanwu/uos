@@ -31,6 +31,7 @@ PROBE_STRING=""
 LOG_PATTERN=""
 TIMEOUT=30
 EXTRA_QEMU_ARGS=""
+ISO_MODE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -41,6 +42,9 @@ while [[ $# -gt 0 ]]; do
             [[ "$proto" == "tcp" ]] || die "probe must be tcp:PORT:STRING"
             PROBE_PORT="$port"
             PROBE_STRING="$string"
+            ;;
+        --iso)
+            ISO_MODE=1
             ;;
         --log-match)
             shift
@@ -102,9 +106,14 @@ QEMU_CMD=(
     -display none
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
     -drive "if=pflash,format=raw,file=$OVMF_VARS_COPY"
-    -drive "format=raw,file=$IMAGE"
-    -device "isa-debug-exit,iobase=0xf4,iosize=0x04"
 )
+
+if [[ -n "$ISO_MODE" ]]; then
+    QEMU_CMD+=(-cdrom "$IMAGE")
+else
+    QEMU_CMD+=(-drive "format=raw,file=$IMAGE")
+    QEMU_CMD+=(-device "isa-debug-exit,iobase=0xf4,iosize=0x04")
+fi
 
 # Add extra args (word-split intentionally)
 if [[ -n "$EXTRA_QEMU_ARGS" ]]; then
@@ -150,6 +159,11 @@ set -e
 
 # Capture actual exit code (timeout returns 124 on timeout)
 if [[ $QEMU_RC -eq 124 ]]; then
+    # On timeout, check log-match before declaring failure
+    if [[ -n "$LOG_PATTERN" ]] && grep -qE "$LOG_PATTERN" "$LOG"; then
+        echo "=== PASS: log matched '$LOG_PATTERN' (QEMU timed out as expected) ==="
+        exit 0
+    fi
     echo "=== FAIL: QEMU timed out after ${TIMEOUT}s ==="
     echo "QEMU log:"
     cat "$LOG"
@@ -160,6 +174,7 @@ fi
 if [[ -n "$LOG_PATTERN" ]]; then
     if grep -qE "$LOG_PATTERN" "$LOG"; then
         echo "=== PASS: log matched '$LOG_PATTERN' ==="
+        exit 0
     else
         echo "=== FAIL: log did not match '$LOG_PATTERN' ==="
         echo "QEMU log:"

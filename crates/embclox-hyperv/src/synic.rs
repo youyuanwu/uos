@@ -4,7 +4,7 @@
 //! writes VMBus responses to the SIMP (SynIC Message Page) at SINT slot 2.
 
 use crate::msr;
-use embclox_e1000::dma::{DmaAllocator, DmaRegion};
+use embclox_dma::{DmaAllocator, DmaRegion};
 use log::*;
 
 /// SynIC message header (16 bytes) as defined by the Hyper-V TLFS.

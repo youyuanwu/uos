@@ -1,3 +1,12 @@
 {
-    "rust-analyzer.check.extraArgs": ["--exclude", "embclox-example", "--exclude", "embclox-unit-tests", "--exclude", "embclox-hyperv-example"]
+    "rust-analyzer.check.extraArgs": [
+        "--exclude",
+        "embclox-example",
+        "--exclude",
+        "embclox-unit-tests",
+        "--exclude",
+        "embclox-hyperv-example",
+        "--exclude",
+        "embclox-tulip-example"
+    ]
 }

@@ -6,7 +6,7 @@ use crate::synic::SynIC;
 use crate::vmbus::ChannelOffer;
 use crate::HvError;
 use core::sync::atomic::AtomicU32;
-use embclox_e1000::dma::{DmaAllocator, DmaRegion};
+use embclox_dma::{DmaAllocator, DmaRegion};
 use embclox_hal_x86::memory::MemoryMapper;
 use log::*;
 

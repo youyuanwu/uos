@@ -11,7 +11,7 @@ use crate::guid::Guid;
 use crate::hypercall::HypercallPage;
 use crate::synic::SynIC;
 use crate::HvError;
-use embclox_e1000::dma::{DmaAllocator, DmaRegion};
+use embclox_dma::{DmaAllocator, DmaRegion};
 use log::*;
 
 // VMBus message connection ID and type

@@ -1,5 +1,5 @@
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
-use embclox_e1000::dma::{DmaAllocator, DmaRegion};
+use embclox_dma::{DmaAllocator, DmaRegion};
 use log::*;
 
 /// DmaAllocator implementation for x86_64 with bootloader offset-mapped memory.

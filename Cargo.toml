@@ -5,20 +5,25 @@ members = [
     "tools/embclox-mkimage",
     "examples",
     "examples-hyperv",
+    "examples-tulip",
     "qemu-tests/unit",
     "crates/embclox-core",
+    "crates/embclox-dma",
     "crates/embclox-e1000",
     "crates/embclox-hal-x86",
     "crates/embclox-hyperv",
+    "crates/embclox-tulip",
     "crates/embclox-test-macros",
 ]
 
 default-members = [
     "tools/embclox-mkimage",
     "crates/embclox-core",
+    "crates/embclox-dma",
     "crates/embclox-e1000",
     "crates/embclox-hal-x86",
     "crates/embclox-hyperv",
+    "crates/embclox-tulip",
     "crates/embclox-test-macros",
 ]
 
@@ -34,7 +39,9 @@ embassy-futures = "0.1"
 embedded-io-async = "0.7"
 
 # Drivers & platform
+embclox-dma = { path = "crates/embclox-dma" }
 embclox-hyperv = { path = "crates/embclox-hyperv" }
+embclox-tulip = { path = "crates/embclox-tulip" }
 embclox-core = { path = "crates/embclox-core" }
 embclox-e1000 = { path = "crates/embclox-e1000" }
 embclox-hal-x86 = { path = "crates/embclox-hal-x86" }
@@ -53,3 +60,9 @@ spin = "0.10"
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

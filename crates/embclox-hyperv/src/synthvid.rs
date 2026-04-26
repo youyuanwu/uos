@@ -9,7 +9,7 @@
 use crate::channel::Channel;
 use crate::guid;
 use crate::HvError;
-use embclox_e1000::dma::{DmaAllocator, DmaRegion};
+use embclox_dma::{DmaAllocator, DmaRegion};
 use log::*;
 
 // Synthvid message types
@@ -94,7 +94,7 @@ impl SynthvidDevice {
         let (vram, use_existing_fb) = if let (Some(phys), Some(vaddr)) = (fb_phys, fb_vaddr) {
             info!("Synthvid: using existing framebuffer at paddr={:#x}", phys);
             (
-                embclox_e1000::dma::DmaRegion {
+                embclox_dma::DmaRegion {
                     vaddr,
                     paddr: phys as usize,
                     size: vram_alloc,

@@ -1,0 +1,20 @@
+[package]
+name = "embclox-tulip-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+limine = "0.5"
+embclox-dma.workspace = true
+embclox-tulip.workspace = true
+embassy-executor.workspace = true
+embassy-net.workspace = true
+embassy-net-driver.workspace = true
+embassy-sync.workspace = true
+embassy-time.workspace = true
+embassy-time-driver.workspace = true
+embedded-io-async.workspace = true
+critical-section = { version = "1", features = ["restore-state-bool"] }
+log.workspace = true
+x86_64.workspace = true
+static_cell.workspace = true

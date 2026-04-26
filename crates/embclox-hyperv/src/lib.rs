@@ -36,7 +36,7 @@ fn checkpoint(stage: u32) {
     }
 }
 
-use embclox_e1000::dma::DmaAllocator;
+use embclox_dma::DmaAllocator;
 use embclox_hal_x86::memory::MemoryMapper;
 
 pub use channel::Channel;
@@ -86,8 +86,8 @@ pub struct VmBus {
     version: u32,
     offers: alloc::vec::Vec<ChannelOffer>,
     /// Child-to-parent monitor page (reserved for future use).
-    _monitor_child_to_parent: embclox_e1000::dma::DmaRegion,
-    _monitor_parent_to_child: embclox_e1000::dma::DmaRegion,
+    _monitor_child_to_parent: embclox_dma::DmaRegion,
+    _monitor_parent_to_child: embclox_dma::DmaRegion,
 }
 
 impl VmBus {

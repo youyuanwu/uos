@@ -302,15 +302,22 @@ version = "0.1.0"
 dependencies = [
  "embassy-net-driver",
  "embassy-sync",
+ "embclox-dma",
  "embclox-e1000",
  "embclox-hal-x86",
+ "embclox-tulip",
  "log",
 ]
+
+[[package]]
+name = "embclox-dma"
+version = "0.1.0"
 
 [[package]]
 name = "embclox-e1000"
 version = "0.1.0"
 dependencies = [
+ "embclox-dma",
  "log",
 ]
 
@@ -353,7 +360,7 @@ dependencies = [
 name = "embclox-hyperv"
 version = "0.1.0"
 dependencies = [
- "embclox-e1000",
+ "embclox-dma",
  "embclox-hal-x86",
  "log",
 ]
@@ -384,6 +391,34 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "embclox-tulip"
+version = "0.1.0"
+dependencies = [
+ "embclox-dma",
+ "log",
+]
+
+[[package]]
+name = "embclox-tulip-example"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "embassy-executor",
+ "embassy-net",
+ "embassy-net-driver",
+ "embassy-sync",
+ "embassy-time",
+ "embassy-time-driver",
+ "embclox-dma",
+ "embclox-tulip",
+ "embedded-io-async",
+ "limine",
+ "log",
+ "static_cell",
+ "x86_64",
 ]
 
 [[package]]
@@ -672,6 +707,15 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "limine"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af6d2ee42712e7bd2c787365cd1dab06ef59a61becbf87bec7b32b970bd2594b"
+dependencies = [
+ "bitflags 2.11.1",
+]
 
 [[package]]
 name = "linked_list_allocator"

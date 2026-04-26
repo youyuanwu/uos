@@ -41,6 +41,10 @@ jobs:
         working-directory: qemu-tests/unit
         run: cargo clippy -- -D warnings
 
+      - name: Clippy tulip example
+        working-directory: examples-tulip
+        run: cargo clippy -- -D warnings
+
       - name: Build disk images
         run: |
           cargo build --manifest-path examples/Cargo.toml --target x86_64-unknown-none
@@ -49,7 +53,10 @@ jobs:
           cargo run -p embclox-mkimage -- target/x86_64-unknown-none/debug/embclox-unit-tests target/x86_64-unknown-none/debug/embclox-unit-tests.img
 
       - name: Install QEMU and OVMF
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf netcat-openbsd
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf netcat-openbsd xorriso
 
       - name: QEMU tests
-        run: cmake -B build && ctest --test-dir build --output-on-failure
+        run: |
+          cmake -B build
+          cmake --build build --target tulip-image
+          ctest --test-dir build --output-on-failure

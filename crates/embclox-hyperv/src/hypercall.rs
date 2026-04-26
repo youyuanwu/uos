@@ -2,7 +2,7 @@
 
 use crate::msr;
 use crate::HvError;
-use embclox_e1000::dma::{DmaAllocator, DmaRegion};
+use embclox_dma::{DmaAllocator, DmaRegion};
 use embclox_hal_x86::memory::{MemoryMapper, MmioMapping};
 use log::*;
 

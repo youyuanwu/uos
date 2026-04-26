@@ -21,6 +21,8 @@ add_custom_target(check
         --target ${TARGET} -- -D warnings
     COMMAND cargo clippy --manifest-path qemu-tests/unit/Cargo.toml
         --target ${TARGET} -- -D warnings
+    COMMAND cargo clippy --manifest-path examples-tulip/Cargo.toml
+        --target ${TARGET} -- -D warnings
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Formatting and linting all crates"
 )
@@ -90,5 +92,89 @@ add_test(NAME integration
         ${IMAGE_ABS}
         --probe tcp:5555:hello-embclox
         --qemu-args "-netdev user,id=net0,hostfwd=tcp::5555-:1234 -device e1000,netdev=net0"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# --- Tulip example (Limine UEFI boot) ---
+
+include(FetchContent)
+FetchContent_Declare(limine
+    URL https://github.com/Limine-Bootloader/Limine/releases/download/v12.0.2/limine-binary.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP ON
+)
+FetchContent_MakeAvailable(limine)
+
+set(LIMINE_BOOTX64 "${limine_SOURCE_DIR}/BOOTX64.EFI")
+set(LIMINE_UEFI_CD "${limine_SOURCE_DIR}/limine-uefi-cd.bin")
+
+set(TULIP_KERNEL_REL "target/${TARGET}/release/embclox-tulip-example")
+
+add_custom_target(tulip-build
+    COMMAND cargo build --release
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/examples-tulip
+    COMMENT "Building Tulip example (Limine UEFI)"
+)
+
+# Build the Limine ISO image for UEFI boot
+set(TULIP_ISO "${CMAKE_BINARY_DIR}/tulip.iso")
+
+add_custom_command(
+    OUTPUT ${TULIP_ISO}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tulip-iso/boot/limine
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tulip-iso/EFI/BOOT
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_SOURCE_DIR}/${TULIP_KERNEL_REL}
+        ${CMAKE_BINARY_DIR}/tulip-iso/boot/kernel
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_SOURCE_DIR}/examples-tulip/limine.conf
+        ${CMAKE_BINARY_DIR}/tulip-iso/boot/limine/limine.conf
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${LIMINE_BOOTX64}
+        ${CMAKE_BINARY_DIR}/tulip-iso/EFI/BOOT/BOOTX64.EFI
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${LIMINE_UEFI_CD}
+        ${CMAKE_BINARY_DIR}/tulip-iso/boot/limine/limine-uefi-cd.bin
+    COMMAND xorriso -as mkisofs
+        --efi-boot boot/limine/limine-uefi-cd.bin
+        -efi-boot-part --efi-boot-image --protective-msdos-label
+        ${CMAKE_BINARY_DIR}/tulip-iso -o ${TULIP_ISO}
+        2>/dev/null
+    DEPENDS tulip-build ${LIMINE_BOOTX64}
+    COMMENT "Creating Tulip UEFI ISO image"
+)
+add_custom_target(tulip-image DEPENDS ${TULIP_ISO})
+
+add_custom_target(qemu-tulip
+    COMMAND qemu-system-x86_64
+        -machine q35
+        -no-reboot
+        -serial mon:stdio
+        -display none
+        -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}
+        -cdrom ${TULIP_ISO}
+        -netdev user,id=net0
+        -device tulip,netdev=net0
+        -m 256M
+    DEPENDS tulip-image
+    COMMENT "Running Tulip example in QEMU (UEFI + Tulip NIC)"
+)
+
+add_test(NAME tulip-boot
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/qemu-test.sh
+        ${TULIP_ISO}
+        --iso
+        --log-match "TULIP INIT PASSED"
+        --timeout 15
+        --qemu-args "-netdev user,id=net0 -device tulip,netdev=net0 -m 256M"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(NAME tulip-echo
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/qemu-test.sh
+        ${TULIP_ISO}
+        --iso
+        --probe tcp:5556:hello-tulip
+        --timeout 30
+        --qemu-args "-netdev user,id=net0,hostfwd=tcp::5556-:1234 -device tulip,netdev=net0 -m 256M"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
