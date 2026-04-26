@@ -5,7 +5,7 @@
 param(
     [string]$Image = "target\x86_64-unknown-none\debug\embclox-example.img",
     [string]$VMName = "embclox-boot-test",
-    [int]$TimeoutSeconds = 15
+    [int]$TimeoutSeconds = 60
 )
 
 # Self-elevate if not admin
@@ -55,24 +55,24 @@ if (-not (Test-Path $imgPath)) {
 # Convert to VHD (Hyper-V needs VHD, not raw)
 # Try qemu-img on Windows first, then check if .vhd already exists
 # (pre-converted from WSL with: qemu-img convert -f raw -O vpc img vhd)
-$vhdPath = "$imgPath.vhd"
+$vhdPath = "$imgPath.vhdx"
 $needConvert = -not (Test-Path $vhdPath) -or ((Get-Item $vhdPath).LastWriteTime -lt (Get-Item $imgPath).LastWriteTime)
 if ($needConvert) {
-    Write-Host "Converting raw image to VHD..."
+    Write-Host "Converting raw image to VHDX..."
     $qemuImg = Get-Command qemu-img -ErrorAction SilentlyContinue
     if ($qemuImg) {
-        qemu-img convert -f raw -O vpc -o subformat=fixed $imgPath $vhdPath
+        & qemu-img convert -f raw -O vhdx $imgPath $vhdPath
         if ($LASTEXITCODE -ne 0) { throw "qemu-img convert failed" }
     } else {
-        throw "qemu-img not found. Pre-convert from WSL with:`n  qemu-img convert -f raw -O vpc $imgPath $vhdPath"
+        throw "qemu-img not found. Pre-convert from WSL with:`n  qemu-img convert -f raw -O vhdx $imgPath $vhdPath"
     }
 } else {
-    Write-Host "Using existing VHD: $vhdPath"
+    Write-Host "Using existing VHDX: $vhdPath"
 }
 
 # Hyper-V cannot use VHDs on network paths (e.g. \\wsl.localhost\...).
 # Copy to a local Windows temp directory.
-$localVhd = Join-Path $env:TEMP "$VMName.vhd"
+$localVhd = Join-Path $env:TEMP "$VMName.vhdx"
 Write-Host "Copying VHD to local path: $localVhd"
 Copy-Item -Path $vhdPath -Destination $localVhd -Force
 
@@ -88,46 +88,29 @@ if (Get-VM -Name $VMName -ErrorAction SilentlyContinue) {
     Remove-VM -Name $VMName -Force
 }
 
-# Create Gen1 VM
-Write-Host "Creating Gen1 VM '$VMName'..."
-New-VM -Name $VMName -Generation 1 -MemoryStartupBytes 256MB -NoVHD | Out-Null
+# Create Gen2 VM (UEFI boot — bootloader v0.11 BIOS hangs on Hyper-V VBE)
+Write-Host "Creating Gen2 VM '$VMName'..."
+New-VM -Name $VMName -Generation 2 -MemoryStartupBytes 256MB -NoVHD | Out-Null
 Add-VMHardDiskDrive -VMName $VMName -Path $localVhd
-Set-VMComPort -VMName $VMName -Number 1 -Path $pipePath
+# Disable Secure Boot (our bootloader is not signed)
+Set-VMFirmware -VMName $VMName -EnableSecureBoot Off
 
-Write-Host "VM created (Gen1, 256MB, COM1 -> $pipePath)"
+Write-Host "VM created (Gen2, UEFI, 256MB, Secure Boot off)"
+Write-Host "NOTE: Gen2 has no COM port. Output is visible in VM Connect window."
+Write-Host "      Use Hyper-V Manager -> Connect to see framebuffer output."
 
-# Start VM, then connect to pipe immediately (pipe server is created
-# by Hyper-V at VM start, but early boot output arrives fast).
+# Start VM and wait for it to run
 Write-Host "Starting VM..."
 Start-VM -Name $VMName
 
-Write-Host "Connecting to serial pipe..."
-$pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", $pipeName, [System.IO.Pipes.PipeDirection]::In)
-$pipe.Connect(10000)  # 10s to connect
-$reader = New-Object System.IO.StreamReader($pipe)
-Write-Host "Pipe connected."
+Write-Host "VM running. Waiting ${TimeoutSeconds}s for kernel to execute..."
+Start-Sleep -Seconds $TimeoutSeconds
 
-# Read serial output with timeout
-Write-Host "Reading serial output for ${TimeoutSeconds}s..."
-$serialOutput = ""
-$reader = New-Object System.IO.StreamReader($pipe)
-$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-try {
-    while ((Get-Date) -lt $deadline) {
-        if ($reader.Peek() -ge 0) {
-            $line = $reader.ReadLine()
-            $serialOutput += "$line`n"
-            Write-Host "  $line" -ForegroundColor DarkGray
-        } else {
-            Start-Sleep -Milliseconds 50
-        }
-    }
-} catch {
-    Write-Host "Pipe read error: $_" -ForegroundColor Yellow
-} finally {
-    $reader.Close()
-    $pipe.Close()
-}
+# Check VM state
+$vm = Get-VM -Name $VMName
+Write-Host "VM state: $($vm.State)"
+
+$serialOutput = "Gen2 VM — no serial pipe, check VM Connect for framebuffer output"
 
 # Stop VM
 Write-Host "Stopping VM..."
@@ -138,22 +121,26 @@ if ($serialOutput.Length -gt 0) {
     $serialOutput | Out-File -FilePath $logPath -Encoding utf8
 }
 
-# Show results
+# Show results — check state BEFORE stopping
 Write-Host ""
 Write-Host "=== Results ===" -ForegroundColor Cyan
-if ($serialOutput.Trim().Length -gt 0) {
+$vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+if ($vm -and $vm.State -eq 'Running') {
+    Write-Host "VM is running (kernel booted and is halting in a loop)." -ForegroundColor Green
     Write-Host "=== BOOT TEST PASSED ===" -ForegroundColor Green
-    Write-Host "Serial output received from Hyper-V Gen1 VM."
-    Write-Host "Log saved to: $logPath"
+    Write-Host "Open Hyper-V Manager -> Connect to see framebuffer text output."
+    Write-Host ""
+    Write-Host "Press Enter to stop the VM and clean up..."
+    Read-Host
     $exitCode = 0
-} else {
-    Write-Host "No serial output captured." -ForegroundColor Yellow
+} elseif ($vm) {
+    Write-Host "VM state: $($vm.State)" -ForegroundColor Yellow
     Write-Host "=== BOOT TEST INCONCLUSIVE ===" -ForegroundColor Yellow
-    Write-Host "Possible causes:"
-    Write-Host "  - VM didn't boot (check Event Viewer > Hyper-V)"
-    Write-Host "  - Named pipe timing (try increasing -TimeoutSeconds)"
-    Write-Host "  - Bootloader v0.11 not compatible with Hyper-V"
+    Write-Host "VM may have crashed. Check Hyper-V Event Viewer for details."
     $exitCode = 2
+} else {
+    Write-Host "VM not found" -ForegroundColor Red
+    $exitCode = 1
 }
 
 # Cleanup

@@ -418,11 +418,10 @@ Remove-Item $VHD
 
 | Concern | Detail |
 |---------|--------|
-| **VM generation** | Must use **Gen2** (UEFI boot). Gen1 hangs due to VBE. |
+| **VM generation** | Target **Gen2** (UEFI boot). Gen1 hangs due to VBE. |
 | **Secure Boot** | Must disable — our bootloader is not signed. |
-| **Debug output** | No COM port — use framebuffer text rendering. |
-| **Exit code** | No `isa-debug-exit` — must parse framebuffer or use test markers. |
-| **Disk format** | Hyper-V needs VHD/VHDX. `qemu-img convert -f raw -O vpc`. |
+| **Debug output** | No COM port, no display without synthvid VMBus driver. Use nested QEMU for now. |
+| **Disk format** | VHDX preferred for Gen2. `qemu-img convert -f raw -O vhdx`. |
 | **Network** | "Default Switch" provides NAT for ARP/DHCP tests. |
 | **Platform** | Requires Windows with Hyper-V enabled — cannot run on Linux. |
 
@@ -553,9 +552,31 @@ Set-VMFirmware -VMName $VMName -EnableSecureBoot Off
 # framebuffer text visible in the VM Connect window
 ```
 
-### Full Driver Matrix (Updated)
+### Hyper-V Display Status
 
-| Target | Boot | Debug Output | Network | Disk |
+**Tested 2026-04-25**: Both Gen1 and Gen2 VMs boot (confirmed by CPU
+activity and "Running" state), but display output is not visible in
+VM Connect:
+
+- **Gen1**: Bootloader hangs on VBE. Serial captures one bootloader
+  line but kernel never starts. Known bootloader issue (#575, #222).
+- **Gen2**: VM runs with CPU activity but VM Connect shows black
+  screen — even the UEFI firmware's own output is not visible. This
+  appears to be a VM Connect / synthetic video display issue, not a
+  kernel problem. Enhanced Session Mode disabled, both VHD and VHDX
+  formats tested.
+
+**Other OSes** (Linux, FreeBSD) work on Gen2 because they include
+the `hyperv_fb` VMBus synthetic video driver. The UEFI GOP
+framebuffer reportedly persists after `ExitBootServices` on Hyper-V,
+but VM Connect may require the synthvid VMBus protocol to actually
+render to the display window.
+
+**Conclusion**: Native Hyper-V display requires implementing the
+synthvid VMBus protocol (`drivers/video/fbdev/hyperv_fb.c` in Linux,
+~800 LOC). This is part of the VMBus infrastructure that must be
+built for netvsc anyway. Until then, use **nested QEMU** for
+development and testing.
 |--------|------|-------------|---------|------|
 | **QEMU** | bootloader BIOS | ✅ COM1 serial | e1000 ✅ / virtio-net (future) | N/A (RAM) |
 | **Hyper-V Gen2** | bootloader UEFI | Framebuffer text | netvsc | N/A (RAM) |
