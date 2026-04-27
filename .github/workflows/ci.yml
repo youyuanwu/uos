@@ -45,6 +45,10 @@ jobs:
         working-directory: examples-tulip
         run: cargo clippy -- -D warnings
 
+      - name: Clippy hyperv example
+        working-directory: examples-hyperv
+        run: cargo clippy -- -D warnings
+
       - name: Build disk images
         run: |
           cargo build --manifest-path examples-e1000/Cargo.toml --target x86_64-unknown-none
@@ -59,4 +63,5 @@ jobs:
         run: |
           cmake -B build
           cmake --build build --target tulip-image
+          cmake --build build --target hyperv-image
           ctest --test-dir build --output-on-failure

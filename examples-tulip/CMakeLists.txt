@@ -1,16 +1,5 @@
 # Tulip example: Limine boot, ISO/VHD images, QEMU tests
-
-include(FetchContent)
-FetchContent_Declare(limine
-    URL https://github.com/Limine-Bootloader/Limine/releases/download/v12.0.2/limine-binary.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP ON
-)
-FetchContent_MakeAvailable(limine)
-
-set(LIMINE_BOOTX64 "${limine_SOURCE_DIR}/BOOTX64.EFI")
-set(LIMINE_UEFI_CD "${limine_SOURCE_DIR}/limine-uefi-cd.bin")
-set(LIMINE_BIOS_CD "${limine_SOURCE_DIR}/limine-bios-cd.bin")
-set(LIMINE_BIOS_SYS "${limine_SOURCE_DIR}/limine-bios.sys")
+# Limine binaries are fetched in the root CMakeLists.txt
 
 set(TULIP_KERNEL_REL "target/${TARGET}/release/embclox-tulip-example")
 

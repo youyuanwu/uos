@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+limine = "0.5"
 embclox-hal-x86.workspace = true
 embclox-hyperv.workspace = true
-embclox-core.workspace = true
-bootloader_api.workspace = true
+embclox-dma.workspace = true
 x86_64.workspace = true
 log.workspace = true

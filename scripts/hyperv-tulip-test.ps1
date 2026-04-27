@@ -12,10 +12,12 @@
 #       cmake -B build
 #       cmake --build build --target tulip-image
 #     This produces build/tulip.iso
-#   - The script self-elevates (Hyper-V cmdlets require admin)
+#   - If your user doesn't have Hyper-V permissions, pass -Elevate to
+#     self-elevate (Hyper-V cmdlets require admin by default)
 #
 # Usage (from PowerShell or WSL):
 #   .\scripts\hyperv-tulip-test.ps1
+#   .\scripts\hyperv-tulip-test.ps1 -Elevate
 #   .\scripts\hyperv-tulip-test.ps1 -Iso build\tulip.iso
 #   .\scripts\hyperv-tulip-test.ps1 -Iso build\tulip.iso -TimeoutSeconds 120
 #
@@ -25,27 +27,30 @@
 param(
     [string]$Iso = "build\tulip.iso",
     [string]$VMName = "embclox-tulip-test",
-    [int]$TimeoutSeconds = 60
+    [int]$TimeoutSeconds = 60,
+    [switch]$Elevate
 )
 
-# Self-elevate if not admin (Hyper-V cmdlets require elevation)
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator
-)
-if (-not $isAdmin) {
-    Write-Host "Requesting elevation..."
-    if ([System.IO.Path]::IsPathRooted($Iso)) {
-        $absIso = $Iso
-    } else {
-        $repoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-        $absIso = Join-Path $repoRoot $Iso
+# Self-elevate when -Elevate is passed (for systems where Hyper-V requires admin)
+if ($Elevate) {
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+    if (-not $isAdmin) {
+        Write-Host "Requesting elevation..."
+        if ([System.IO.Path]::IsPathRooted($Iso)) {
+            $absIso = $Iso
+        } else {
+            $repoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+            $absIso = Join-Path $repoRoot $Iso
+        }
+        $logFile = Join-Path $env:TEMP "embclox-tulip-test.log"
+        $argList = "-ExecutionPolicy Bypass -Command `"& '$PSCommandPath' -Iso '$absIso' -VMName '$VMName' -TimeoutSeconds $TimeoutSeconds *>&1 | Tee-Object -FilePath '$logFile'`""
+        Start-Process -FilePath "pwsh.exe" -ArgumentList $argList -Verb RunAs -Wait
+        Write-Host "=== Elevated output saved to: $logFile ==="
+        if (Test-Path $logFile) { Get-Content $logFile }
+        exit $LASTEXITCODE
     }
-    $logFile = Join-Path $env:TEMP "embclox-tulip-test.log"
-    $argList = "-ExecutionPolicy Bypass -Command `"& '$PSCommandPath' -Iso '$absIso' -VMName '$VMName' -TimeoutSeconds $TimeoutSeconds *>&1 | Tee-Object -FilePath '$logFile'`""
-    Start-Process -FilePath "pwsh.exe" -ArgumentList $argList -Verb RunAs -Wait
-    Write-Host "=== Elevated output saved to: $logFile ==="
-    if (Test-Path $logFile) { Get-Content $logFile }
-    exit $LASTEXITCODE
 }
 
 trap {

@@ -369,10 +369,10 @@ dependencies = [
 name = "embclox-hyperv-example"
 version = "0.1.0"
 dependencies = [
- "bootloader_api",
- "embclox-core",
+ "embclox-dma",
  "embclox-hal-x86",
  "embclox-hyperv",
+ "limine",
  "log",
  "x86_64",
 ]

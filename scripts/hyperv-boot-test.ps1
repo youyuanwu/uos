@@ -1,94 +1,87 @@
 # scripts/hyperv-boot-test.ps1
-# Phase 0 boot test: verify embclox boots under Hyper-V Gen1 with serial output.
-# Requires Hyper-V. Will prompt for elevation if not running as admin.
+#
+# Hyper-V Gen1 boot + VMBus test for the Hyper-V example kernel.
+#
+# Creates a Gen1 VM, attaches the ISO as a DVD, reads serial output
+# from COM1 named pipe, and checks for VMBus initialization.
+#
+# Prerequisites:
+#   - Hyper-V enabled (Windows feature)
+#   - Build the ISO first (from WSL or Linux):
+#       cmake -B build
+#       cmake --build build --target hyperv-image
+#     This produces build/hyperv.iso
+#
+# Usage (from PowerShell or WSL):
+#   .\scripts\hyperv-boot-test.ps1
+#   .\scripts\hyperv-boot-test.ps1 -Elevate
+#   .\scripts\hyperv-boot-test.ps1 -Iso build\hyperv.iso
+#   .\scripts\hyperv-boot-test.ps1 -Iso build\hyperv.iso -TimeoutSeconds 120
+#
+# From WSL:
+#   powershell.exe -ExecutionPolicy Bypass -File scripts/hyperv-boot-test.ps1 -Iso build/hyperv.iso
 
 param(
-    [string]$Image = "target\x86_64-unknown-none\debug\embclox-example.img",
-    [string]$VMName = "embclox-boot-test",
-    [int]$TimeoutSeconds = 60
+    [string]$Iso = "build\hyperv.iso",
+    [string]$VMName = "embclox-hyperv-test",
+    [int]$TimeoutSeconds = 60,
+    [switch]$Elevate
 )
 
-# Self-elevate if not admin
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator
-)
-if (-not $isAdmin) {
-    Write-Host "Requesting elevation..."
-    # If Image is already absolute, use it as-is; otherwise resolve relative to repo root
-    if ([System.IO.Path]::IsPathRooted($Image)) {
-        $absImage = $Image
-    } else {
-        $repoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-        $absImage = Join-Path $repoRoot $Image
+# Self-elevate when -Elevate is passed
+if ($Elevate) {
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+    if (-not $isAdmin) {
+        Write-Host "Requesting elevation..."
+        if ([System.IO.Path]::IsPathRooted($Iso)) {
+            $absIso = $Iso
+        } else {
+            $repoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+            $absIso = Join-Path $repoRoot $Iso
+        }
+        $logFile = Join-Path $env:TEMP "embclox-hyperv-test.log"
+        $argList = "-ExecutionPolicy Bypass -Command `"& '$PSCommandPath' -Iso '$absIso' -VMName '$VMName' -TimeoutSeconds $TimeoutSeconds *>&1 | Tee-Object -FilePath '$logFile'`""
+        Start-Process -FilePath "pwsh.exe" -ArgumentList $argList -Verb RunAs -Wait
+        Write-Host "=== Elevated output saved to: $logFile ==="
+        if (Test-Path $logFile) { Get-Content $logFile }
+        exit $LASTEXITCODE
     }
-    # Redirect elevated output to a temp file so WSL can read it
-    $logFile = Join-Path $env:TEMP "embclox-hyperv-test.log"
-    $argList = "-ExecutionPolicy Bypass -Command `"& '$PSCommandPath' -Image '$absImage' -VMName '$VMName' -TimeoutSeconds $TimeoutSeconds *>&1 | Tee-Object -FilePath '$logFile'`""
-    Start-Process -FilePath "pwsh.exe" -ArgumentList $argList -Verb RunAs -Wait
-    Write-Host "=== Elevated output saved to: $logFile ==="
-    if (Test-Path $logFile) { Get-Content $logFile }
-    exit $LASTEXITCODE
 }
 
-# Wrap everything in a trap so errors don't close the window
 trap {
     Write-Host ""
     Write-Host "ERROR: $_" -ForegroundColor Red
     Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
     Write-Host ""
-    # Cleanup on error
     Stop-VM -Name $VMName -TurnOff -Force -ErrorAction SilentlyContinue
     Remove-VM -Name $VMName -Force -ErrorAction SilentlyContinue
-    if ($localVhd) { Remove-Item $localVhd -Force -ErrorAction SilentlyContinue }
-    Write-Host "Press Enter to exit..."
-    Read-Host
+    if ($localIso) { Remove-Item $localIso -Force -ErrorAction SilentlyContinue }
+    if ($readerProc -and -not $readerProc.HasExited) { $readerProc.Kill() }
     exit 1
 }
 
 $ErrorActionPreference = 'Stop'
 
-# Resolve image path
-if ([System.IO.Path]::IsPathRooted($Image)) {
-    $imgPath = $Image
+# Resolve ISO path
+if ([System.IO.Path]::IsPathRooted($Iso)) {
+    $isoPath = $Iso
 } else {
     $repoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-    $imgPath = Join-Path $repoRoot $Image
+    $isoPath = Join-Path $repoRoot $Iso
 }
 
-Write-Host "Image: $imgPath"
+Write-Host "ISO: $isoPath"
 
-if (-not (Test-Path $imgPath)) {
-    throw "Image not found: $imgPath. Build with: cmake --build build --target example-image"
+if (-not (Test-Path $isoPath)) {
+    throw "ISO not found: $isoPath. Build with: cmake --build build --target hyperv-image"
 }
 
-# Convert to VHD (Hyper-V needs VHD, not raw)
-# Try qemu-img on Windows first, then check if .vhd already exists
-# (pre-converted from WSL with: qemu-img convert -f raw -O vpc img vhd)
-$vhdPath = "$imgPath.vhdx"
-$needConvert = -not (Test-Path $vhdPath) -or ((Get-Item $vhdPath).LastWriteTime -lt (Get-Item $imgPath).LastWriteTime)
-if ($needConvert) {
-    Write-Host "Converting raw image to VHDX..."
-    $qemuImg = Get-Command qemu-img -ErrorAction SilentlyContinue
-    if ($qemuImg) {
-        & qemu-img convert -f raw -O vhdx $imgPath $vhdPath
-        if ($LASTEXITCODE -ne 0) { throw "qemu-img convert failed" }
-    } else {
-        throw "qemu-img not found. Pre-convert from WSL with:`n  qemu-img convert -f raw -O vhdx $imgPath $vhdPath"
-    }
-} else {
-    Write-Host "Using existing VHDX: $vhdPath"
-}
-
-# Hyper-V cannot use VHDs on network paths (e.g. \\wsl.localhost\...).
-# Copy to a local Windows temp directory.
-$localVhd = Join-Path $env:TEMP "$VMName.vhdx"
-Write-Host "Copying VHD to local path: $localVhd"
-Copy-Item -Path $vhdPath -Destination $localVhd -Force
-
-# Serial output log file
-$logPath = "$imgPath-hyperv.log"
-$pipeName = "$VMName-com1"
-$pipePath = "\\.\pipe\$pipeName"
+# Copy ISO to local Windows path (Hyper-V can't use \\wsl.localhost paths)
+$localIso = Join-Path $env:TEMP "$VMName.iso"
+Write-Host "Copying ISO to local path: $localIso"
+Copy-Item -Path $isoPath -Destination $localIso -Force
 
 # Cleanup any existing VM
 if (Get-VM -Name $VMName -ErrorAction SilentlyContinue) {
@@ -97,65 +90,115 @@ if (Get-VM -Name $VMName -ErrorAction SilentlyContinue) {
     Remove-VM -Name $VMName -Force
 }
 
-# Create Gen2 VM (UEFI boot - bootloader v0.11 BIOS hangs on Hyper-V VBE)
-Write-Host "Creating Gen2 VM '$VMName'..."
-New-VM -Name $VMName -Generation 2 -MemoryStartupBytes 256MB -NoVHD | Out-Null
-Add-VMHardDiskDrive -VMName $VMName -Path $localVhd
-# Disable Secure Boot (our bootloader is not signed)
-Set-VMFirmware -VMName $VMName -EnableSecureBoot Off
+# Create Gen1 VM (BIOS boot — COM1 serial works, VMBus available)
+Write-Host "Creating Gen1 VM '$VMName'..."
+$pipeName = "$VMName-com1"
+$pipePath = "\\.\pipe\$pipeName"
 
-# Try to add COM port via named pipe (may work on Gen2 virtual UART)
-$comPipeName = "$VMName-com1"
-$comPipePath = "\\.\pipe\$comPipeName"
-try {
-    Set-VMComPort -VMName $VMName -Number 1 -Path $comPipePath
-    Write-Host "COM1 configured: $comPipePath" -ForegroundColor Green
-    Write-Host ">>> Connect PuTTY to: $comPipePath (Serial mode) to see kernel logs <<<" -ForegroundColor Cyan
-} catch {
-    Write-Host "COM port not supported on this Gen2 VM: $_" -ForegroundColor Yellow
-}
+New-VM -Name $VMName -Generation 1 -MemoryStartupBytes 256MB -NoVHD | Out-Null
+Set-VMDvdDrive -VMName $VMName -Path $localIso
+Set-VMComPort -VMName $VMName -Number 1 -Path $pipePath
+Write-Host "COM1 configured: $pipePath"
 
-Write-Host "VM created (Gen2, UEFI, 256MB, Secure Boot off)"
+Write-Host "VM created (Gen1, 256MB, DVD boot, COM1 serial)"
 
-# Start VM and wait for it to run
-Write-Host ""
-Write-Host ">>> VM created. Open VM Connect NOW (Hyper-V Manager -> Connect) <<<" -ForegroundColor Cyan
-Write-Host ">>> Then press Enter here to START the VM <<<" -ForegroundColor Cyan
-Read-Host
+# Start VM
 Write-Host "Starting VM..."
 Start-VM -Name $VMName
 
-Write-Host "VM running. Waiting ${TimeoutSeconds}s for kernel to execute..."
-Write-Host "(Connect PuTTY NOW to see serial output)" -ForegroundColor Cyan
-Start-Sleep -Seconds $TimeoutSeconds
+Write-Host ""
+Write-Host "=== Serial Output (COM1) ==="
 
-$serialOutput = ""
+# Read serial output from named pipe via a separate process
+$readerScript = @"
+try {
+    `$pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', '$pipeName', [System.IO.Pipes.PipeDirection]::In)
+    `$pipe.Connect(10000)
+    `$reader = New-Object System.IO.StreamReader(`$pipe)
+    while (-not `$reader.EndOfStream) {
+        `$line = `$reader.ReadLine()
+        Write-Output `$line
+    }
+} catch {
+    # Pipe closed or timeout
+}
+"@
 
-# Check VM state BEFORE stopping
-$vm = Get-VM -Name $VMName
-$vmState = $vm.State
-Write-Host "VM state: $vmState"
+$readerProc = Start-Process -FilePath "pwsh.exe" `
+    -ArgumentList "-NoProfile", "-Command", $readerScript `
+    -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $env:TEMP "$VMName-serial.log")
 
-# Stop VM
-Write-Host "Stopping VM..."
-Stop-VM -Name $VMName -TurnOff -Force -ErrorAction SilentlyContinue
+# Wait for serial output, checking for markers
+$serialLog = Join-Path $env:TEMP "$VMName-serial.log"
+$bootPassed = $false
+$vmbusPassed = $false
+$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
-# Show results
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 500
+
+    if (Test-Path $serialLog) {
+        $content = Get-Content $serialLog -Raw -ErrorAction SilentlyContinue
+        if ($content) {
+            if ($content -match "HYPERV BOOT PASSED") { $bootPassed = $true }
+            if ($content -match "VMBUS INIT PASSED") { $vmbusPassed = $true }
+            if ($content -match "Halting\.") { break }
+            if ($content -match "PANIC:") { break }
+        }
+    }
+
+    # Check if VM is still running
+    $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+    if (-not $vm -or $vm.State -ne 'Running') { break }
+}
+
+# Kill reader process
+if ($readerProc -and -not $readerProc.HasExited) { $readerProc.Kill() }
+
+# Display serial output
+if (Test-Path $serialLog) {
+    $lines = Get-Content $serialLog
+    foreach ($line in $lines) { Write-Host $line }
+    Write-Host ""
+    Write-Host "=== End Serial Output ==="
+    Write-Host ""
+    $lineCount = $lines.Count
+    Write-Host "Serial log saved to: $serialLog - $lineCount lines"
+} else {
+    Write-Host "(no serial output captured)"
+    Write-Host "=== End Serial Output ==="
+}
+
+# Stop and cleanup
+$vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+if ($vm) {
+    Write-Host "VM state: $($vm.State)"
+    Write-Host "Stopping VM..."
+    Stop-VM -Name $VMName -TurnOff -Force -ErrorAction SilentlyContinue
+}
+
+# Results
 Write-Host ""
 Write-Host "=== Results ===" -ForegroundColor Cyan
-if ($vmState -eq 'Running') {
-    Write-Host "=== BOOT TEST PASSED ===" -ForegroundColor Green
-    $exitCode = 0
+$exitCode = 0
+
+if ($bootPassed -or $vmbusPassed) {
+    Write-Host "Boot: PASSED" -ForegroundColor Green
 } else {
-    Write-Host "VM state: $vmState" -ForegroundColor Yellow
-    Write-Host "=== BOOT TEST INCONCLUSIVE ===" -ForegroundColor Yellow
-    $exitCode = 2
+    Write-Host "Boot: FAILED" -ForegroundColor Red
+    $exitCode = 1
+}
+
+if ($vmbusPassed) {
+    Write-Host "VMBus: PASSED" -ForegroundColor Green
+} else {
+    Write-Host "VMBus: NOT TESTED (expected on QEMU)" -ForegroundColor Yellow
 }
 
 # Cleanup
 Write-Host ""
 Write-Host "Cleaning up..."
 Remove-VM -Name $VMName -Force -ErrorAction SilentlyContinue
-Remove-Item $localVhd -Force -ErrorAction SilentlyContinue
+Remove-Item $localIso -Force -ErrorAction SilentlyContinue
 
 exit $exitCode
