@@ -24,7 +24,8 @@
 param(
     [string]$Iso = "build\hyperv.iso",
     [string]$VMName = "embclox-hyperv-test",
-    [int]$TimeoutSeconds = 60,
+    [int]$TimeoutSeconds = 90,
+    [string]$SwitchName = "Default Switch",
     [switch]$Elevate
 )
 
@@ -100,6 +101,18 @@ Set-VMDvdDrive -VMName $VMName -Path $localIso
 Set-VMComPort -VMName $VMName -Number 1 -Path $pipePath
 Write-Host "COM1 configured: $pipePath"
 
+# Attach the (single, default) NIC to a vSwitch so the synthetic NetVSC
+# device has somewhere to send/receive frames.
+if ($SwitchName) {
+    $vSwitch = Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue
+    if ($vSwitch) {
+        Get-VMNetworkAdapter -VMName $VMName | Connect-VMNetworkAdapter -SwitchName $SwitchName
+        Write-Host "Network adapter connected to vSwitch: $SwitchName"
+    } else {
+        Write-Host "vSwitch '$SwitchName' not found - leaving NIC unconnected" -ForegroundColor Yellow
+    }
+}
+
 Write-Host "VM created (Gen1, 256MB, DVD boot, COM1 serial)"
 
 # Start VM
@@ -132,6 +145,8 @@ $readerProc = Start-Process -FilePath "pwsh.exe" `
 $serialLog = Join-Path $env:TEMP "$VMName-serial.log"
 $bootPassed = $false
 $vmbusPassed = $false
+$netvscPassed = $false
+$phase3Done = $false
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
 while ((Get-Date) -lt $deadline) {
@@ -142,6 +157,8 @@ while ((Get-Date) -lt $deadline) {
         if ($content) {
             if ($content -match "HYPERV BOOT PASSED") { $bootPassed = $true }
             if ($content -match "VMBUS INIT PASSED") { $vmbusPassed = $true }
+            if ($content -match "NETVSC INIT PASSED") { $netvscPassed = $true }
+            if ($content -match "PHASE3 SMOKE TEST DONE") { $phase3Done = $true }
             if ($content -match "Halting\.") { break }
             if ($content -match "PANIC:") { break }
         }
@@ -193,6 +210,18 @@ if ($vmbusPassed) {
     Write-Host "VMBus: PASSED" -ForegroundColor Green
 } else {
     Write-Host "VMBus: NOT TESTED (expected on QEMU)" -ForegroundColor Yellow
+}
+
+if ($netvscPassed) {
+    Write-Host "NetVSC: PASSED" -ForegroundColor Green
+} else {
+    Write-Host "NetVSC: NOT TESTED" -ForegroundColor Yellow
+}
+
+if ($phase3Done) {
+    Write-Host "Phase 3 (TX/RX smoke): DONE" -ForegroundColor Green
+} else {
+    Write-Host "Phase 3 (TX/RX smoke): NOT REACHED" -ForegroundColor Yellow
 }
 
 # Cleanup

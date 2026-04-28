@@ -181,6 +181,212 @@ impl DmaAllocator for LimineDmaAllocator {
     }
 }
 
+/// Build a minimal DHCP DISCOVER packet (Ethernet + IPv4 + UDP + DHCP).
+/// Total size is exactly 300 bytes (well above the 60-byte Ethernet minimum).
+fn build_dhcp_discover(mac: [u8; 6], xid: u32) -> [u8; 300] {
+    let mut frame = [0u8; 300];
+
+    // Ethernet header: dst=broadcast, src=our MAC, type=IPv4
+    frame[0..6].copy_from_slice(&[0xff; 6]);
+    frame[6..12].copy_from_slice(&mac);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+
+    // IPv4 header (20 bytes): src=0.0.0.0, dst=255.255.255.255, proto=UDP
+    let ip_total = (300u16 - 14).to_be_bytes(); // 286
+    frame[14] = 0x45; // version=4, IHL=5
+    frame[15] = 0x00; // DSCP/ECN
+    frame[16..18].copy_from_slice(&ip_total);
+    frame[18..20].copy_from_slice(&0u16.to_be_bytes()); // ID
+    frame[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // flags=DF, frag=0
+    frame[22] = 64; // TTL
+    frame[23] = 17; // proto=UDP
+    // checksum at 24..26 (filled below)
+    frame[26..30].copy_from_slice(&[0, 0, 0, 0]); // src IP
+    frame[30..34].copy_from_slice(&[255, 255, 255, 255]); // dst IP
+    let ip_csum = ipv4_checksum(&frame[14..34]);
+    frame[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // UDP header (8 bytes): src=68 (client), dst=67 (server)
+    let udp_total = (300u16 - 14 - 20).to_be_bytes(); // 266
+    frame[34..36].copy_from_slice(&68u16.to_be_bytes());
+    frame[36..38].copy_from_slice(&67u16.to_be_bytes());
+    frame[38..40].copy_from_slice(&udp_total);
+    // UDP checksum (38..40 ... wait, that's length). UDP checksum is at 40..42.
+    frame[40..42].copy_from_slice(&0u16.to_be_bytes()); // checksum=0 (optional for IPv4)
+
+    // DHCP message (BOOTREQUEST). DHCP body starts at frame offset 42
+    // (14 Ethernet + 20 IPv4 + 8 UDP). The fixed BOOTP header is 236 bytes,
+    // so the magic cookie sits at frame offset 42 + 236 = 278.
+    frame[42] = 1; // op=BOOTREQUEST
+    frame[43] = 1; // htype=Ethernet
+    frame[44] = 6; // hlen
+    frame[45] = 0; // hops
+    frame[46..50].copy_from_slice(&xid.to_be_bytes()); // xid
+    frame[50..52].copy_from_slice(&0u16.to_be_bytes()); // secs
+    frame[52..54].copy_from_slice(&0x8000u16.to_be_bytes()); // flags=BROADCAST
+    // ciaddr (54..58), yiaddr (58..62), siaddr (62..66), giaddr (66..70) = 0
+    // chaddr at frame 70..86 (16 bytes; first 6 = our MAC)
+    frame[70..76].copy_from_slice(&mac);
+    // sname (86..150) + file (150..278) zeroed
+
+    // Magic cookie at frame[278..282]
+    frame[278..282].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+    // DHCP options (start at frame[282])
+    let opt = 282;
+    // Option 53: DHCP Message Type = 1 (DISCOVER)
+    frame[opt] = 53;
+    frame[opt + 1] = 1;
+    frame[opt + 2] = 1; // DISCOVER
+    // Option 55: Parameter Request List (subnet mask, router, DNS)
+    frame[opt + 3] = 55;
+    frame[opt + 4] = 3;
+    frame[opt + 5] = 1; // subnet mask
+    frame[opt + 6] = 3; // router
+    frame[opt + 7] = 6; // DNS
+    // End option
+    frame[opt + 8] = 0xff;
+
+    frame
+}
+
+/// Compute IPv4 header checksum (one's complement sum of 16-bit words).
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < header.len() {
+        sum += u16::from_be_bytes([header[i], header[i + 1]]) as u32;
+        i += 2;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Phase 3 NetVSC smoke test: send a gratuitous ARP and dump any received
+/// Ethernet frames. Verifies the RNDIS_PACKET_MSG TX and RX paths end-to-end
+/// against the host vSwitch.
+fn phase3_smoke_test(
+    serial: &mut SerialPort,
+    netvsc: &mut embclox_hyperv::netvsc::NetvscDevice,
+    mac: [u8; 6],
+) {
+    // Crank up logging while we exercise the data path so we can see every
+    // VMBus packet pass through poll_channel/try_receive.
+    log::set_max_level(log::LevelFilter::Trace);
+    // 1) Gratuitous ARP for 169.254.42.42
+    writeln!(serial, "PHASE3: building gratuitous ARP for 169.254.42.42").ok();
+    // Pad to Ethernet minimum (60 bytes) — some switches drop runts.
+    let mut arp_frame = [0u8; 60];
+
+    arp_frame[0..6].copy_from_slice(&[0xff; 6]);
+    arp_frame[6..12].copy_from_slice(&mac);
+    arp_frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+
+    let our_ip: [u8; 4] = [169, 254, 42, 42];
+    arp_frame[14..16].copy_from_slice(&1u16.to_be_bytes()); // HTYPE=Ethernet
+    arp_frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes()); // PTYPE=IPv4
+    arp_frame[18] = 6; // HLEN
+    arp_frame[19] = 4; // PLEN
+    arp_frame[20..22].copy_from_slice(&1u16.to_be_bytes()); // OPER=request
+    arp_frame[22..28].copy_from_slice(&mac);
+    arp_frame[28..32].copy_from_slice(&our_ip);
+    arp_frame[32..38].copy_from_slice(&[0; 6]);
+    arp_frame[38..42].copy_from_slice(&our_ip);
+    // bytes 42..60 stay zero (Ethernet pad)
+
+    if let Err(e) = netvsc.transmit(&arp_frame) {
+        writeln!(serial, "PHASE3: ARP transmit failed: {}", e).ok();
+        return;
+    }
+    writeln!(
+        serial,
+        "PHASE3: gratuitous ARP sent ({} bytes)",
+        arp_frame.len()
+    )
+    .ok();
+
+    // 2) DHCP DISCOVER — Default Switch runs a DHCP server, this should
+    //    elicit an OFFER.
+    let xid: u32 = 0xdeadbeef;
+    let dhcp_frame = build_dhcp_discover(mac, xid);
+    if let Err(e) = netvsc.transmit(&dhcp_frame) {
+        writeln!(serial, "PHASE3: DHCP transmit failed: {}", e).ok();
+        return;
+    }
+    writeln!(
+        serial,
+        "PHASE3: DHCP DISCOVER sent ({} bytes, xid={:#x})",
+        dhcp_frame.len(),
+        xid
+    )
+    .ok();
+
+    // 3) Drain RX. Loop until we see ~8 frames or run out of iterations.
+    //    Each iteration is dominated by the inner spin (~2.5us on Hyper-V),
+    //    so 6M iterations is roughly 15 seconds of wall-clock wait.
+    let mut rx_buf = [0u8; 2048];
+    let mut frames_seen = 0u32;
+    let mut dhcp_offer_seen = false;
+    for i in 0..6_000_000u64 {
+        match netvsc.try_receive(&mut rx_buf) {
+            Ok(Some(n)) => {
+                frames_seen += 1;
+                let dump_len = n.min(48);
+                writeln!(
+                    serial,
+                    "PHASE3: rx frame #{} len={} bytes={:02x?}",
+                    frames_seen,
+                    n,
+                    &rx_buf[..dump_len]
+                )
+                .ok();
+                // Look for a UDP packet from port 67 (DHCP server) addressed
+                // to our MAC or broadcast — that's our DHCP OFFER.
+                if n >= 42
+                    && rx_buf[12..14] == [0x08, 0x00]
+                    && rx_buf[23] == 17
+                    && rx_buf[34..36] == [0x00, 0x43]
+                {
+                    dhcp_offer_seen = true;
+                    writeln!(serial, "PHASE3: DHCP reply detected").ok();
+                }
+                if frames_seen >= 8 {
+                    break;
+                }
+            }
+            Ok(None) => {
+                for _ in 0..100 {
+                    core::hint::spin_loop();
+                }
+            }
+            Err(e) => {
+                writeln!(serial, "PHASE3: try_receive error: {}", e).ok();
+                break;
+            }
+        }
+        if i > 0 && i.is_multiple_of(2_000_000) {
+            writeln!(
+                serial,
+                "PHASE3: still polling (iter {}M, rx={})",
+                i / 1_000_000,
+                frames_seen
+            )
+            .ok();
+        }
+    }
+
+    if frames_seen == 0 {
+        writeln!(serial, "PHASE3: no frames received").ok();
+    }
+    writeln!(
+        serial,
+        "PHASE3 SMOKE TEST DONE: rx={} dhcp_reply={}",
+        frames_seen, dhcp_offer_seen
+    )
+    .ok();
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
     let mut serial = SerialPort::new(0x3F8);
@@ -304,14 +510,18 @@ unsafe extern "C" fn kmain() -> ! {
                     // --- NetVSC init ---
                     writeln!(serial, "Starting NetVSC init...").ok();
                     match embclox_hyperv::netvsc::NetvscDevice::init(&mut vmbus, &dma, &memory) {
-                        Ok(netvsc) => {
+                        Ok(mut netvsc) => {
+                            let mac = netvsc.mac();
                             writeln!(
                                 serial,
                                 "NETVSC INIT PASSED: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} MTU={}",
-                                netvsc.mac()[0], netvsc.mac()[1], netvsc.mac()[2],
-                                netvsc.mac()[3], netvsc.mac()[4], netvsc.mac()[5],
+                                mac[0], mac[1], mac[2],
+                                mac[3], mac[4], mac[5],
                                 netvsc.mtu(),
                             ).ok();
+
+                            // --- Phase 3: TX/RX smoke test ---
+                            phase3_smoke_test(&mut serial, &mut netvsc, mac);
                         }
                         Err(e) => {
                             writeln!(serial, "NetVSC init failed: {}", e).ok();

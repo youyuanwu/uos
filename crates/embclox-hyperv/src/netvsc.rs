@@ -316,7 +316,7 @@ impl NetvscDevice {
 
     /// Send an RNDIS control message via the send buffer.
     fn send_rndis_control(&mut self, rndis_msg: &[u8]) -> Result<(), HvError> {
-        info!(
+        trace!(
             "NetVSC: send_rndis_control: len={} type={:#x}",
             rndis_msg.len(),
             if rndis_msg.len() >= 4 {
@@ -367,9 +367,13 @@ impl NetvscDevice {
 
         while let Some((desc, raw_len)) = self.channel.try_recv_raw(&mut raw)? {
             processed = true;
-            info!(
+            trace!(
                 "NetVSC: poll: pkt type={} off8={} len8={} raw_len={} txid={}",
-                desc.packet_type, desc.offset8, desc.len8, raw_len, desc.transaction_id
+                desc.packet_type,
+                desc.offset8,
+                desc.len8,
+                raw_len,
+                desc.transaction_id
             );
             match VmbusPacketType::from_u16(desc.packet_type) {
                 Some(VmbusPacketType::DataUsingXferPages) => {
@@ -394,12 +398,12 @@ impl NetvscDevice {
                             let nvsp_type = u32::from_le_bytes(
                                 raw[nvsp_offset..nvsp_offset + 4].try_into().unwrap(),
                             );
-                            info!("NetVSC: poll: in-band NVSP type={}", nvsp_type);
+                            trace!("NetVSC: poll: in-band NVSP type={}", nvsp_type);
                         }
                     }
                 }
                 _ => {
-                    info!("NetVSC: poll: unknown pkt type={}", desc.packet_type);
+                    trace!("NetVSC: poll: unknown pkt type={}", desc.packet_type);
                 }
             }
         }
@@ -414,7 +418,7 @@ impl NetvscDevice {
     ) -> Result<(), HvError> {
         let mut buf = [0u8; 256];
         let len = self.parse_xfer_page_packet(raw, &mut buf);
-        info!(
+        trace!(
             "NetVSC: xfer page: len={} rndis_type={:#x}",
             len,
             if len >= 4 {
@@ -441,7 +445,7 @@ impl NetvscDevice {
                 | RndisResponse::QueryComplete { .. }
                 | RndisResponse::SetComplete { .. },
             ) => {
-                info!(
+                trace!(
                     "NetVSC: ctrl response len={} data={:02x?}",
                     len,
                     &buf[..len.min(40)]
@@ -670,10 +674,34 @@ impl NetvscDevice {
 
     // ── Data path (Phase 3) ─────────────────────────────────────────
 
+    /// Wait for send buffer section 0 to become free by draining TX completions.
+    /// Returns Err(Timeout) if no completion arrives within the spin budget.
+    fn wait_send_section_free(&mut self) -> Result<(), HvError> {
+        if self.send_section_free {
+            return Ok(());
+        }
+        for _ in 0..50_000_000u64 {
+            self.poll_channel()?;
+            if self.send_section_free {
+                return Ok(());
+            }
+            for _ in 0..100 {
+                core::hint::spin_loop();
+            }
+        }
+        error!("NetVSC: transmit timed out waiting for send section");
+        Err(HvError::Timeout)
+    }
+
     /// Transmit an Ethernet frame via RNDIS_PACKET_MSG.
+    ///
+    /// Uses send-buffer section 0 (single-section design); blocks until the
+    /// previous TX completion is observed before reusing the section.
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), HvError> {
         let rndis_len = RNDIS_PACKET_HDR_SIZE + frame.len();
         assert!(rndis_len <= NETVSC_SEND_BUF_SIZE);
+
+        self.wait_send_section_free()?;
 
         // Build RNDIS_PACKET_MSG header + frame in send buffer
         let dst = self.send_buf.vaddr as *mut u8;
@@ -705,18 +733,24 @@ impl NetvscDevice {
 
         let txid = self.next_txid;
         self.next_txid += 1;
+        self.send_section_free = false;
         self.channel.send(&bytes, txid)
     }
 
     /// Try to receive an Ethernet frame. Returns the frame length, or None
-    /// if no frame is available.
+    /// if no frame is available right now.
+    ///
+    /// Drains TX completions and unsolicited control messages along the way
+    /// so the caller does not need to poll separately.
     pub fn try_receive(&mut self, frame_buf: &mut [u8]) -> Result<Option<usize>, HvError> {
         let mut raw = [0u8; 512];
-        if let Some((desc, raw_len)) = self.channel.try_recv_raw(&mut raw)? {
+        // Loop so non-data packets (TX completions, in-band, control) don't
+        // hide a data packet that's waiting right behind them.
+        while let Some((desc, raw_len)) = self.channel.try_recv_raw(&mut raw)? {
             match VmbusPacketType::from_u16(desc.packet_type) {
                 Some(VmbusPacketType::DataUsingXferPages) => {
                     let rndis_len = self.parse_xfer_page_packet(&raw[..raw_len], frame_buf);
-                    // Send completion
+                    // Send completion back to host so it can release the buffer slot
                     let mut comp = [0u8; 8];
                     comp[0..4].copy_from_slice(
                         &NvspMessageType::SendRndisPktComplete.as_u32().to_le_bytes(),
@@ -724,12 +758,36 @@ impl NetvscDevice {
                     comp[4..8].copy_from_slice(&ffi::NVSP_STAT_SUCCESS.to_le_bytes());
                     let _ = self.channel.send_completion(&comp, desc.transaction_id);
 
-                    if rndis_len > 0 {
-                        return self.extract_rndis_frame(frame_buf, rndis_len);
+                    if rndis_len >= RNDIS_HEADER_SIZE {
+                        // Only return Ethernet PACKET messages here; control
+                        // responses (KEEPALIVE etc.) are dispatched in-line
+                        // and we keep draining.
+                        let msg_type = u32::from_le_bytes(frame_buf[0..4].try_into().unwrap());
+                        if msg_type == RndisMessageType::Packet.as_u32() {
+                            if let Ok(Some(n)) = self.extract_rndis_frame(frame_buf, rndis_len) {
+                                return Ok(Some(n));
+                            }
+                        } else {
+                            // KeepAlive etc. — handle and continue draining.
+                            let _ = self.extract_rndis_frame(frame_buf, rndis_len);
+                        }
                     }
                 }
-                Some(VmbusPacketType::Completion | VmbusPacketType::DataInBand) => {
-                    // TX completion or control — ignore
+                Some(VmbusPacketType::Completion) => {
+                    // TX completion: free our send-buffer section if this
+                    // is the SEND_RNDIS_PKT_COMPLETE for our outstanding TX.
+                    let nvsp_offset = (desc.offset8 as usize) * 8 - 16;
+                    if nvsp_offset + 4 <= raw_len {
+                        let msg_type = u32::from_le_bytes(
+                            raw[nvsp_offset..nvsp_offset + 4].try_into().unwrap(),
+                        );
+                        if msg_type == NvspMessageType::SendRndisPktComplete.as_u32() {
+                            self.send_section_free = true;
+                        }
+                    }
+                }
+                Some(VmbusPacketType::DataInBand) => {
+                    // Unsolicited NVSP control (e.g., link status) — skip.
                 }
                 _ => {}
             }
