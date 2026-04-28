@@ -12,8 +12,17 @@ use core::mem;
 
 // ── NVSP message size ───────────────────────────────────────────────────
 
-/// Minimum NVSP message size expected by the host (header + union).
-pub const NVSP_MESSAGE_SIZE: usize = mem::size_of::<ffi::nvsp_message>();
+/// Minimum NVSP message size sent on the VMBus ring buffer.
+///
+/// The mu_msvm `NVSP_MESSAGE` struct is 32 bytes (it omits v6 PacketDirect
+/// messages from the union), while the Linux kernel's `nvsp_message` is 40
+/// bytes (includes `nvsp_6_message_uber` which contains the large
+/// `nvsp_6_pd_api_comp` struct with `grp_affinity`).
+///
+/// The mu_msvm UEFI firmware sends 32 bytes via its EMCL abstraction layer,
+/// but our raw VMBus ring writes require 40 bytes (matching the Linux kernel's
+/// `vmbus_sendpacket` behavior) for the host to process messages correctly.
+pub const NVSP_MESSAGE_SIZE: usize = 40;
 
 /// RNDIS header size: ndis_msg_type(4) + msg_len(4).
 pub const RNDIS_HEADER_SIZE: usize = 8;
@@ -60,16 +69,16 @@ pub fn parse_nvsp_response(data: &[u8]) -> Option<NvspResponse<'_>> {
         x if x == NvspMessageType::InitComplete.as_u32() => {
             let c = unsafe { cast_ref::<ffi::nvsp_message_init_complete>(body)? };
             Some(NvspResponse::InitComplete {
-                negotiated_version: c.negotiated_protocol_ver,
-                max_mdl_chain_len: c.max_mdl_chain_len,
-                status: c.status,
+                negotiated_version: c.Deprecated,
+                max_mdl_chain_len: c.MaximumMdlChainLength,
+                status: c.Status,
             })
         }
         x if x == NvspMessageType::SendReceiveBufferComplete.as_u32() => {
             let c = unsafe { cast_ref::<ffi::nvsp_1_message_send_receive_buffer_complete>(body)? };
             let section_size = mem::size_of::<ffi::nvsp_1_receive_buffer_section>();
             let sections_data = &body[8..]; // after status(4) + num_sections(4)
-            let n = (sections_data.len() / section_size).min(c.num_sections as usize);
+            let n = (sections_data.len() / section_size).min(c.NumSections as usize);
             let sections = if n > 0 {
                 unsafe {
                     core::slice::from_raw_parts(
@@ -81,21 +90,21 @@ pub fn parse_nvsp_response(data: &[u8]) -> Option<NvspResponse<'_>> {
                 &[]
             };
             Some(NvspResponse::RecvBufComplete {
-                status: c.status,
-                num_sections: c.num_sections,
+                status: c.Status,
+                num_sections: c.NumSections,
                 sections,
             })
         }
         x if x == NvspMessageType::SendSendBufferComplete.as_u32() => {
             let c = unsafe { cast_ref::<ffi::nvsp_1_message_send_send_buffer_complete>(body)? };
             Some(NvspResponse::SendBufComplete {
-                status: c.status,
-                section_size: c.section_size,
+                status: c.Status,
+                section_size: c.SectionSize,
             })
         }
         x if x == NvspMessageType::SendRndisPktComplete.as_u32() => {
             let c = unsafe { cast_ref::<ffi::nvsp_1_message_send_rndis_packet_complete>(body)? };
-            Some(NvspResponse::RndisPktComplete { status: c.status })
+            Some(NvspResponse::RndisPktComplete { status: c.Status })
         }
         _ => Some(NvspResponse::Unknown(msg_type)),
     }
@@ -115,9 +124,23 @@ unsafe fn cast_ref<T>(data: &[u8]) -> Option<&T> {
     Some(&*(data.as_ptr() as *const T))
 }
 
-/// View an `nvsp_message` as a byte slice.
+/// View an `nvsp_message` as a byte slice (struct-sized, 32 bytes).
+/// Use `nvsp_message_padded` to get the host-required 40-byte version.
 pub fn nvsp_message_as_bytes(msg: &ffi::nvsp_message) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(msg as *const _ as *const u8, NVSP_MESSAGE_SIZE) }
+    unsafe {
+        core::slice::from_raw_parts(
+            msg as *const _ as *const u8,
+            mem::size_of::<ffi::nvsp_message>(),
+        )
+    }
+}
+
+/// Copy an `nvsp_message` into a 40-byte buffer (host-required minimum size).
+pub fn nvsp_message_padded(msg: &ffi::nvsp_message) -> [u8; NVSP_MESSAGE_SIZE] {
+    let mut buf = [0u8; NVSP_MESSAGE_SIZE];
+    let src = nvsp_message_as_bytes(msg);
+    buf[..src.len()].copy_from_slice(src);
+    buf
 }
 
 /// View an `rndis_message` as a byte slice.
@@ -135,23 +158,24 @@ pub fn rndis_message_as_bytes(msg: &ffi::rndis_message) -> &[u8] {
 /// Build an NVSP_MSG_TYPE_INIT message.
 pub fn build_nvsp_init(version: u32) -> ffi::nvsp_message {
     let mut msg = ffi::nvsp_message::default();
-    msg.hdr.msg_type = NvspMessageType::Init.as_u32();
-    unsafe {
-        let init = msg.msg.init_msg.as_mut();
-        init.init.min_protocol_ver = version;
-        init.init.max_protocol_ver = version;
-    }
+    msg.Header.MessageType = NvspMessageType::Init.as_u32();
+    msg.Messages
+        .InitMessages
+        .Init
+        .__bindgen_anon_1
+        .ProtocolVersion = version;
+    msg.Messages.InitMessages.Init.ProtocolVersion2 = version;
     msg
 }
 
 /// Build an NVSP_MSG1_TYPE_SEND_NDIS_VER message.
 pub fn build_nvsp_send_ndis_version(major: u32, minor: u32) -> ffi::nvsp_message {
     let mut msg = ffi::nvsp_message::default();
-    msg.hdr.msg_type = NvspMessageType::SendNdisVersion.as_u32();
+    msg.Header.MessageType = NvspMessageType::SendNdisVersion.as_u32();
     unsafe {
-        let ver = msg.msg.v1_msg.as_mut().send_ndis_ver.as_mut();
-        ver.ndis_major_ver = major;
-        ver.ndis_minor_ver = minor;
+        let ver = &mut msg.Messages.Version1Messages.SendNdisVersion;
+        ver.NdisMajorVersion = major;
+        ver.NdisMinorVersion = minor;
     }
     msg
 }
@@ -159,11 +183,11 @@ pub fn build_nvsp_send_ndis_version(major: u32, minor: u32) -> ffi::nvsp_message
 /// Build an NVSP_MSG2_TYPE_SEND_NDIS_CONFIG message.
 pub fn build_nvsp_send_ndis_config(mtu: u32, capabilities: u64) -> ffi::nvsp_message {
     let mut msg = ffi::nvsp_message::default();
-    msg.hdr.msg_type = NvspMessageType::SendNdisConfig.as_u32();
+    msg.Header.MessageType = NvspMessageType::SendNdisConfig.as_u32();
     unsafe {
-        let v2 = msg.msg.v2_msg.as_mut();
-        v2.send_ndis_config.mtu = mtu;
-        v2.send_ndis_config.capability.data = capabilities;
+        let v2 = &mut msg.Messages.Version2Messages;
+        v2.SendNdisConfig.MTU = mtu;
+        v2.SendNdisConfig.Capabilities.__bindgen_anon_1.AsUINT64 = capabilities;
     }
     msg
 }
@@ -171,11 +195,11 @@ pub fn build_nvsp_send_ndis_config(mtu: u32, capabilities: u64) -> ffi::nvsp_mes
 /// Build an NVSP_MSG1_TYPE_SEND_RECV_BUF message.
 pub fn build_nvsp_send_recv_buf(gpadl_handle: u32, id: u16) -> ffi::nvsp_message {
     let mut msg = ffi::nvsp_message::default();
-    msg.hdr.msg_type = NvspMessageType::SendReceiveBuffer.as_u32();
+    msg.Header.MessageType = NvspMessageType::SendReceiveBuffer.as_u32();
     unsafe {
-        let buf = msg.msg.v1_msg.as_mut().send_recv_buf.as_mut();
-        buf.gpadl_handle = gpadl_handle;
-        buf.id = id;
+        let buf = &mut msg.Messages.Version1Messages.SendReceiveBuffer;
+        buf.GpadlHandle = gpadl_handle;
+        buf.Id = id;
     }
     msg
 }
@@ -183,11 +207,11 @@ pub fn build_nvsp_send_recv_buf(gpadl_handle: u32, id: u16) -> ffi::nvsp_message
 /// Build an NVSP_MSG1_TYPE_SEND_SEND_BUF message.
 pub fn build_nvsp_send_send_buf(gpadl_handle: u32, id: u16) -> ffi::nvsp_message {
     let mut msg = ffi::nvsp_message::default();
-    msg.hdr.msg_type = NvspMessageType::SendSendBuffer.as_u32();
+    msg.Header.MessageType = NvspMessageType::SendSendBuffer.as_u32();
     unsafe {
-        let buf = msg.msg.v1_msg.as_mut().send_send_buf.as_mut();
-        buf.gpadl_handle = gpadl_handle;
-        buf.id = id;
+        let buf = &mut msg.Messages.Version1Messages.SendSendBuffer;
+        buf.GpadlHandle = gpadl_handle;
+        buf.Id = id;
     }
     msg
 }
@@ -203,12 +227,12 @@ pub fn build_nvsp_send_rndis_pkt(
     send_buf_section_size: u32,
 ) -> ffi::nvsp_message {
     let mut msg = ffi::nvsp_message::default();
-    msg.hdr.msg_type = NvspMessageType::SendRndisPkt.as_u32();
+    msg.Header.MessageType = NvspMessageType::SendRndisPkt.as_u32();
     unsafe {
-        let pkt = msg.msg.v1_msg.as_mut().send_rndis_pkt.as_mut();
-        pkt.channel_type = channel_type;
-        pkt.send_buf_section_index = send_buf_section_index;
-        pkt.send_buf_section_size = send_buf_section_size;
+        let pkt = &mut msg.Messages.Version1Messages.SendRNDISPacket;
+        pkt.ChannelType = channel_type;
+        pkt.SendBufferSectionIndex = send_buf_section_index;
+        pkt.SendBufferSectionSize = send_buf_section_size;
     }
     msg
 }
@@ -271,48 +295,48 @@ pub fn parse_rndis_response(data: &[u8]) -> Option<RndisResponse<'_>> {
         Some(RndisMessageType::InitComplete) => {
             let c = unsafe { cast_ref::<ffi::rndis_initialize_complete>(body)? };
             Some(RndisResponse::InitComplete {
-                req_id: c.req_id,
-                status: RndisStatus(c.status),
-                major_ver: c.major_ver,
-                minor_ver: c.minor_ver,
-                max_pkt_per_msg: c.max_pkt_per_msg,
-                max_xfer_size: c.max_xfer_size,
-                pkt_alignment_factor: c.pkt_alignment_factor,
+                req_id: c.RequestId,
+                status: RndisStatus(c.Status),
+                major_ver: c.MajorVersion,
+                minor_ver: c.MinorVersion,
+                max_pkt_per_msg: c.MaxPacketsPerMessage,
+                max_xfer_size: c.MaxTransferSize,
+                pkt_alignment_factor: c.PacketAlignmentFactor,
             })
         }
         Some(RndisMessageType::QueryComplete) => {
             let c = unsafe { cast_ref::<ffi::rndis_query_complete>(body)? };
-            let info_buflen = c.info_buflen as usize;
-            let info_buf_offset = c.info_buf_offset as usize;
+            let info_buflen = c.InformationBufferLength as usize;
+            let info_buf_offset = c.InformationBufferOffset as usize;
             let info = if info_buflen > 0 && info_buf_offset + info_buflen <= body.len() {
                 &body[info_buf_offset..info_buf_offset + info_buflen]
             } else {
                 &[]
             };
             Some(RndisResponse::QueryComplete {
-                req_id: c.req_id,
-                status: RndisStatus(c.status),
+                req_id: c.RequestId,
+                status: RndisStatus(c.Status),
                 info,
             })
         }
         Some(RndisMessageType::SetComplete) => {
             let c = unsafe { cast_ref::<ffi::rndis_set_complete>(body)? };
             Some(RndisResponse::SetComplete {
-                req_id: c.req_id,
-                status: RndisStatus(c.status),
+                req_id: c.RequestId,
+                status: RndisStatus(c.Status),
             })
         }
         Some(RndisMessageType::KeepAliveComplete) => {
             let c = unsafe { cast_ref::<ffi::rndis_keepalive_complete>(body)? };
             Some(RndisResponse::KeepAliveComplete {
-                req_id: c.req_id,
-                status: RndisStatus(c.status),
+                req_id: c.RequestId,
+                status: RndisStatus(c.Status),
             })
         }
         Some(RndisMessageType::Indicate) => {
             let c = unsafe { cast_ref::<ffi::rndis_indicate_status>(body)? };
-            let status_buflen = c.status_buflen as usize;
-            let status_buf_offset = c.status_buf_offset as usize;
+            let status_buflen = c.StatusBufferLength as usize;
+            let status_buf_offset = c.StatusBufferOffset as usize;
             let status_buf = if status_buflen > 0 && status_buf_offset + status_buflen <= body.len()
             {
                 &body[status_buf_offset..status_buf_offset + status_buflen]
@@ -320,15 +344,15 @@ pub fn parse_rndis_response(data: &[u8]) -> Option<RndisResponse<'_>> {
                 &[]
             };
             Some(RndisResponse::Indicate {
-                status: RndisStatus(c.status),
+                status: RndisStatus(c.Status),
                 status_buf,
             })
         }
         Some(RndisMessageType::Packet) => {
             let c = unsafe { cast_ref::<ffi::rndis_packet>(body)? };
             Some(RndisResponse::Packet {
-                data_offset: c.data_offset,
-                data_len: c.data_len,
+                data_offset: c.DataOffset,
+                data_len: c.DataLength,
                 raw: data,
             })
         }
@@ -341,14 +365,15 @@ pub fn parse_rndis_response(data: &[u8]) -> Option<RndisResponse<'_>> {
 /// Build an RNDIS_MSG_INIT message.
 pub fn build_rndis_init(req_id: u32, max_xfer_size: u32) -> ffi::rndis_message {
     let mut msg = ffi::rndis_message::default();
-    msg.ndis_msg_type = RndisMessageType::Init.as_u32();
-    msg.msg_len = (RNDIS_HEADER_SIZE + mem::size_of::<ffi::rndis_initialize_request>()) as u32;
+    msg.NdisMessageType = RndisMessageType::Init.as_u32();
+    msg.MessageLength =
+        (RNDIS_HEADER_SIZE + mem::size_of::<ffi::rndis_initialize_request>()) as u32;
     unsafe {
-        let init = msg.msg.init_req.as_mut();
-        init.req_id = req_id;
-        init.major_ver = ffi::RNDIS_MAJOR_VERSION;
-        init.minor_ver = ffi::RNDIS_MINOR_VERSION;
-        init.max_xfer_size = max_xfer_size;
+        let init = &mut msg.Message.InitializeRequest;
+        init.RequestId = req_id;
+        init.MajorVersion = ffi::RNDIS_MAJOR_VERSION;
+        init.MinorVersion = ffi::RNDIS_MINOR_VERSION;
+        init.MaxTransferSize = max_xfer_size;
     }
     msg
 }
@@ -356,11 +381,9 @@ pub fn build_rndis_init(req_id: u32, max_xfer_size: u32) -> ffi::rndis_message {
 /// Build an RNDIS_MSG_HALT message.
 pub fn build_rndis_halt(req_id: u32) -> ffi::rndis_message {
     let mut msg = ffi::rndis_message::default();
-    msg.ndis_msg_type = RndisMessageType::Halt.as_u32();
-    msg.msg_len = (RNDIS_HEADER_SIZE + mem::size_of::<ffi::rndis_halt_request>()) as u32;
-    unsafe {
-        msg.msg.halt_req.as_mut().req_id = req_id;
-    }
+    msg.NdisMessageType = RndisMessageType::Halt.as_u32();
+    msg.MessageLength = (RNDIS_HEADER_SIZE + mem::size_of::<ffi::rndis_halt_request>()) as u32;
+    msg.Message.HaltRequest.RequestId = req_id;
     msg
 }
 
@@ -375,14 +398,14 @@ pub fn build_rndis_query(req_id: u32, oid: NdisOid, info_buf: &[u8], buf: &mut [
 
     // Write header + fixed fields via struct
     let mut msg = ffi::rndis_message::default();
-    msg.ndis_msg_type = RndisMessageType::Query.as_u32();
-    msg.msg_len = msg_len as u32;
+    msg.NdisMessageType = RndisMessageType::Query.as_u32();
+    msg.MessageLength = msg_len as u32;
     unsafe {
-        let q = msg.msg.query_req.as_mut();
-        q.req_id = req_id;
-        q.oid = oid.0;
-        q.info_buflen = info_buf.len() as u32;
-        q.info_buf_offset = query_req_size as u32;
+        let q = &mut msg.Message.QueryRequest;
+        q.RequestId = req_id;
+        q.Oid = oid.0;
+        q.InformationBufferLength = info_buf.len() as u32;
+        q.InformationBufferOffset = query_req_size as u32;
     }
 
     // Copy struct bytes, then append info_buf
@@ -406,14 +429,14 @@ pub fn build_rndis_set(req_id: u32, oid: NdisOid, info_buf: &[u8], buf: &mut [u8
     assert!(buf.len() >= msg_len);
 
     let mut msg = ffi::rndis_message::default();
-    msg.ndis_msg_type = RndisMessageType::Set.as_u32();
-    msg.msg_len = msg_len as u32;
+    msg.NdisMessageType = RndisMessageType::Set.as_u32();
+    msg.MessageLength = msg_len as u32;
     unsafe {
-        let s = msg.msg.set_req.as_mut();
-        s.req_id = req_id;
-        s.oid = oid.0;
-        s.info_buflen = info_buf.len() as u32;
-        s.info_buf_offset = set_req_fixed_size as u32;
+        let s = &mut msg.Message.SetRequest;
+        s.RequestId = req_id;
+        s.Oid = oid.0;
+        s.InformationBufferLength = info_buf.len() as u32;
+        s.InformationBufferOffset = set_req_fixed_size as u32;
     }
 
     let struct_bytes = rndis_message_as_bytes(&msg);
@@ -428,10 +451,8 @@ pub fn build_rndis_set(req_id: u32, oid: NdisOid, info_buf: &[u8], buf: &mut [u8
 /// Build an RNDIS_MSG_KEEPALIVE message.
 pub fn build_rndis_keepalive(req_id: u32) -> ffi::rndis_message {
     let mut msg = ffi::rndis_message::default();
-    msg.ndis_msg_type = RndisMessageType::KeepAlive.as_u32();
-    msg.msg_len = (RNDIS_HEADER_SIZE + mem::size_of::<ffi::rndis_keepalive_request>()) as u32;
-    unsafe {
-        msg.msg.keep_alive_req.as_mut().req_id = req_id;
-    }
+    msg.NdisMessageType = RndisMessageType::KeepAlive.as_u32();
+    msg.MessageLength = (RNDIS_HEADER_SIZE + mem::size_of::<ffi::rndis_keepalive_request>()) as u32;
+    msg.Message.KeepaliveRequest.RequestId = req_id;
     msg
 }

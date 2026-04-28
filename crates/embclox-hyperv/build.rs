@@ -7,13 +7,14 @@ fn main() {
     // Re-run if any header changes
     println!("cargo:rerun-if-changed={}", include_dir.display());
 
-    // Generate bindings for NVSP/RNDIS wire-format structs
+    // Generate bindings for NVSP/RNDIS wire-format structs (from microsoft/mu_msvm)
     let bindings = bindgen::Builder::default()
-        .header(include_dir.join("hyperv_net_bindgen.h").to_str().unwrap())
-        .header(include_dir.join("rndis.h").to_str().unwrap())
-        .header(include_dir.join("hyperv_vmbus.h").to_str().unwrap())
+        .header(include_dir.join("nvspprotocol.h").to_str().unwrap())
+        .header(include_dir.join("rndis_msvm.h").to_str().unwrap())
+        .header(include_dir.join("VmbusPacketFormat.h").to_str().unwrap())
         // Freestanding mode: no libc headers needed when cross-compiling to bare metal
         .clang_args(["-ffreestanding", "-nostdinc"])
+        .clang_arg(format!("-I{}", include_dir.to_str().unwrap()))
         .use_core()
         .derive_debug(true)
         .derive_default(true)

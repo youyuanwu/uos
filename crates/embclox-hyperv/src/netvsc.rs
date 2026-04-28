@@ -10,9 +10,8 @@ use crate::guid;
 use crate::nvsp_msg::{
     build_nvsp_init, build_nvsp_send_ndis_config, build_nvsp_send_ndis_version,
     build_nvsp_send_recv_buf, build_nvsp_send_rndis_pkt, build_nvsp_send_send_buf,
-    build_rndis_init, build_rndis_query, build_rndis_set, nvsp_message_as_bytes,
-    parse_nvsp_response, parse_rndis_response, rndis_message_as_bytes, NvspResponse, RndisResponse,
-    RNDIS_HEADER_SIZE,
+    build_rndis_init, build_rndis_query, build_rndis_set, nvsp_message_padded, parse_nvsp_response,
+    parse_rndis_response, rndis_message_as_bytes, NvspResponse, RndisResponse, RNDIS_HEADER_SIZE,
 };
 use crate::nvsp_types::{
     NdisOid, NdisPacketFilter, NvspMessageType, NvspVersion, RndisMessageType, VmbusPacketType,
@@ -117,7 +116,7 @@ impl NetvscDevice {
                 (6, 1)
             };
             let msg = build_nvsp_send_ndis_version(major, minor);
-            channel.send_raw(nvsp_message_as_bytes(&msg), 98)?;
+            channel.send_raw(&nvsp_message_padded(&msg), 98)?;
             info!("NetVSC: sent NDIS_VER {}.{}", major, minor);
         }
 
@@ -142,7 +141,7 @@ impl NetvscDevice {
         // Send NVSP_MSG1_TYPE_SEND_RECV_BUF
         let msg =
             build_nvsp_send_recv_buf(recv_gpadl, crate::nvsp_types::buffer::RECEIVE_BUFFER_ID);
-        channel.send(nvsp_message_as_bytes(&msg), 1)?;
+        channel.send(&nvsp_message_padded(&msg), 1)?;
 
         // Wait for SEND_RECV_BUF_COMPLETE (may arrive as completion type 11 with payload)
         let mut resp = [0u8; 256];
@@ -189,7 +188,7 @@ impl NetvscDevice {
 
         // Send NVSP_MSG1_TYPE_SEND_SEND_BUF
         let msg = build_nvsp_send_send_buf(send_gpadl, crate::nvsp_types::buffer::SEND_BUFFER_ID);
-        channel.send(nvsp_message_as_bytes(&msg), 2)?;
+        channel.send(&nvsp_message_padded(&msg), 2)?;
 
         // Wait for SEND_SEND_BUF_COMPLETE (may arrive as completion type 11 with payload)
         let resp_len = loop {
@@ -285,7 +284,7 @@ impl NetvscDevice {
         // Try from highest to lowest
         for &ver in NvspVersion::NEGOTIATE_ORDER {
             let msg = build_nvsp_init(ver.as_u32());
-            channel.send(nvsp_message_as_bytes(&msg), 0)?;
+            channel.send(&nvsp_message_padded(&msg), 0)?;
 
             let mut resp = [0u8; 256];
             let (_desc, resp_len) = channel.recv_with_timeout(&mut resp, 5_000_000)?;
@@ -299,7 +298,7 @@ impl NetvscDevice {
                     if ver != NvspVersion::V1 {
                         let mtu: u32 = 1514 + 14; // MTU + ETH_HLEN
                         let cfg = build_nvsp_send_ndis_config(mtu, 1); // ieee8021q=1
-                        channel.send_raw(nvsp_message_as_bytes(&cfg), 99)?;
+                        channel.send_raw(&nvsp_message_padded(&cfg), 99)?;
                     }
                     return Ok(ver.as_u32());
                 }
@@ -350,12 +349,12 @@ impl NetvscDevice {
         }
 
         let nvsp = build_nvsp_send_rndis_pkt(1, 0, rndis_msg.len() as u32);
-        let bytes = nvsp_message_as_bytes(&nvsp);
+        let bytes = nvsp_message_padded(&nvsp);
 
         self.send_section_free = false; // Mark section as in use
         let txid = self.next_txid;
         self.next_txid += 1;
-        self.channel.send(bytes, txid)
+        self.channel.send(&bytes, txid)
     }
 
     // ── Channel dispatch loop ────────────────────────────────────
@@ -513,8 +512,8 @@ impl NetvscDevice {
 
         // Cast first range (RNDIS responses are typically single-range)
         let range = unsafe { &*(raw[8..].as_ptr() as *const ffi::vmtransfer_page_range) };
-        let byte_count = range.byte_count as usize;
-        let byte_offset = range.byte_offset as usize;
+        let byte_count = range.ByteCount as usize;
+        let byte_offset = range.ByteOffset as usize;
 
         if byte_offset + byte_count > NETVSC_RECV_BUF_SIZE || byte_count == 0 {
             warn!(
@@ -542,7 +541,7 @@ impl NetvscDevice {
 
         let msg = build_rndis_init(req_id, 0x4000);
         let msg_bytes = rndis_message_as_bytes(&msg);
-        let send_len = msg.msg_len as usize;
+        let send_len = msg.MessageLength as usize;
         info!(
             "NetVSC: sending RNDIS_INIT req_id={} msg_len={} struct_size={}",
             req_id,
@@ -690,8 +689,8 @@ impl NetvscDevice {
             // Write rndis_packet struct at offset 8
             let pkt = dst.add(RNDIS_HEADER_SIZE) as *mut ffi::rndis_packet;
             core::ptr::write_bytes(pkt, 0, 1);
-            (*pkt).data_offset = (core::mem::size_of::<ffi::rndis_packet>()) as u32;
-            (*pkt).data_len = frame.len() as u32;
+            (*pkt).DataOffset = (core::mem::size_of::<ffi::rndis_packet>()) as u32;
+            (*pkt).DataLength = frame.len() as u32;
             // Copy Ethernet frame after header
             core::ptr::copy_nonoverlapping(
                 frame.as_ptr(),
@@ -702,11 +701,11 @@ impl NetvscDevice {
 
         // Send NVSP_MSG1_TYPE_SEND_RNDIS_PKT (channel_type=0 for data)
         let nvsp = build_nvsp_send_rndis_pkt(0, 0, rndis_len as u32);
-        let bytes = nvsp_message_as_bytes(&nvsp);
+        let bytes = nvsp_message_padded(&nvsp);
 
         let txid = self.next_txid;
         self.next_txid += 1;
-        self.channel.send(bytes, txid)
+        self.channel.send(&bytes, txid)
     }
 
     /// Try to receive an Ethernet frame. Returns the frame length, or None
@@ -782,8 +781,8 @@ impl NetvscDevice {
         }
 
         let nvsp = build_nvsp_send_rndis_pkt(1, 0, rndis_msg.len() as u32);
-        let bytes = nvsp_message_as_bytes(&nvsp);
+        let bytes = nvsp_message_padded(&nvsp);
 
-        self.channel.send(bytes, 0)
+        self.channel.send(&bytes, 0)
     }
 }

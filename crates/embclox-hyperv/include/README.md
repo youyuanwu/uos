@@ -1,21 +1,23 @@
 # Hyper-V Header Files
 
-Linux kernel headers used as reference for generating Rust bindings via bindgen.
+Protocol headers for generating Rust bindings via bindgen.
 
-Source: Linux v7.0 (`/include/linux/`)
+Source: [microsoft/mu_msvm](https://github.com/microsoft/mu_msvm) — Microsoft's UEFI VM firmware (Project Mu).
+License: BSD-2-Clause-Patent
 
 ## Files
 
 | File | Origin | Description |
 |------|--------|-------------|
-| `hyperv_net_bindgen.h` | Simplified | Stripped version of `drivers/net/hyperv/hyperv_net.h` for bindgen. Removes all Linux dependencies (`sk_buff`, `net_device`, `spinlock`, XDP, etc.) while keeping NVSP/RNDIS wire-format structs, protocol constants, and message type enums. Adds freestanding typedefs and RNDIS/OID constants. |
-| `rndis.h` | Direct copy | `include/linux/rndis.h` — RNDIS protocol constants (message types, status codes, OIDs, packet filter bits). Self-contained, no Linux dependencies. |
-| `hyperv_vmbus.h` | Simplified | VMBus wire-format structs extracted from `include/linux/hyperv.h`. Contains `vmpacket_descriptor`, `vmtransfer_page_range`, `vmtransfer_page_packet_header`, `vmdata_gpa_direct`, and `enum vmbus_packet_type`. |
+| `msvm_compat.h` | Local | Compatibility shim providing freestanding type definitions (`UINT8`/`UINT16`/`UINT32`/`UINT64`/`BOOLEAN`) so mu_msvm headers compile without UEFI build infrastructure. |
+| `nvspprotocol.h` | mu_msvm | `MsvmPkg/NetvscDxe/nvspprotocol.h` — NVSP protocol message types, status codes, and all wire-format structs for VMBus network channel communication. |
+| `rndis_msvm.h` | mu_msvm | `MsvmPkg/NetvscDxe/rndis.h` — RNDIS (Remote NDIS) protocol: message types, status codes, request/response structs, OIDs. |
+| `VmbusPacketFormat.h` | mu_msvm | `MsvmPkg/Include/Vmbus/VmbusPacketFormat.h` — VMBus ring buffer packet descriptors: `VMPACKET_DESCRIPTOR`, `VMTRANSFER_PAGE_RANGE`, `VMTRANSFER_PAGE_PACKET_HEADER`, `VMBUS_PACKET_TYPE` enum. |
 
 ## Updating
 
-When updating from a newer kernel version:
+When updating from a newer mu_msvm release:
 
-1. Copy the new `rndis.h` directly (it has no Linux dependencies)
-2. Re-run the extraction for `hyperv_net_bindgen.h` and `hyperv_vmbus.h`
-3. Verify with `gcc -fsyntax-only -std=c11 <file>`
+1. Download updated headers from `microsoft/mu_msvm`
+2. Replace `#include "AllowNamelessAggregate.h"` and `#include "StaticAssert1.h"` with `#include "msvm_compat.h"`
+3. Verify with `gcc -ffreestanding -nostdinc -fsyntax-only -std=c11 <file>`

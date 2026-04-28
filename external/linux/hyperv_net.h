@@ -7,23 +7,18 @@
  *   Haiyang Zhang <haiyangz@microsoft.com>
  *   Hank Janssen  <hjanssen@microsoft.com>
  *   K. Y. Srinivasan <kys@microsoft.com>
- *
- * Stripped of Linux kernel-specific code for use with bindgen.
  */
 
 #ifndef _HYPERV_NET_H
 #define _HYPERV_NET_H
 
-/* Freestanding type definitions (no libc headers needed) */
-typedef unsigned char u8;
-typedef unsigned short u16;
-typedef unsigned int u32;
-typedef unsigned long long u64;
+#include <linux/list.h>
+#include <linux/hyperv.h>
+#include <linux/rndis.h>
+#include <linux/jhash.h>
+#include <net/xdp.h>
 
-#ifndef __packed
-#define __packed __attribute__((packed))
-#endif
-
+/* RSS related */
 #define OID_GEN_RECEIVE_SCALE_CAPABILITIES 0x00010203  /* query only */
 #define OID_GEN_RECEIVE_SCALE_PARAMETERS 0x00010204  /* query and set */
 
@@ -151,7 +146,43 @@ struct ndis_pkt_8021q_info {
 	};
 };
 
+/*
+ * Represent netvsc packet which contains 1 RNDIS and 1 ethernet frame
+ * within the RNDIS
+ *
+ * The size of this structure is less than 48 bytes and we can now
+ * place this structure in the skb->cb field.
+ */
+struct hv_netvsc_packet {
+	/* Bookkeeping stuff */
+	u8 cp_partial; /* partial copy into send buffer */
+
+	u8 rmsg_size; /* RNDIS header and PPI size */
+	u8 page_buf_cnt;
+
+	u16 q_idx;
+	u16 total_packets;
+
+	u32 total_bytes;
+	u32 send_buf_index;
+	u32 total_data_buflen;
+	struct hv_dma_range *dma_range;
+};
+
 #define NETVSC_HASH_KEYLEN 40
+
+struct netvsc_device_info {
+	unsigned char mac_adr[ETH_ALEN];
+	u32  num_chn;
+	u32  send_sections;
+	u32  recv_sections;
+	u32  send_section_size;
+	u32  recv_section_size;
+
+	struct bpf_prog *bprog;
+
+	u8 rss_key[NETVSC_HASH_KEYLEN];
+};
 
 enum rndis_device_state {
 	RNDIS_DEV_UNINITIALIZED = 0,
@@ -159,6 +190,92 @@ enum rndis_device_state {
 	RNDIS_DEV_INITIALIZED,
 	RNDIS_DEV_DATAINITIALIZED,
 };
+
+struct rndis_device {
+	struct net_device *ndev;
+
+	enum rndis_device_state state;
+
+	atomic_t new_req_id;
+
+	spinlock_t request_lock;
+	struct list_head req_list;
+
+	struct work_struct mcast_work;
+	u32 filter;
+
+	bool link_state;        /* 0 - link up, 1 - link down */
+
+	u8 hw_mac_adr[ETH_ALEN];
+	u8 rss_key[NETVSC_HASH_KEYLEN];
+};
+
+
+/* Interface */
+struct rndis_message;
+struct ndis_offload_params;
+struct netvsc_device;
+struct netvsc_channel;
+struct net_device_context;
+
+extern u32 netvsc_ring_bytes;
+
+struct netvsc_device *netvsc_device_add(struct hv_device *device,
+					const struct netvsc_device_info *info);
+int netvsc_alloc_recv_comp_ring(struct netvsc_device *net_device, u32 q_idx);
+void netvsc_device_remove(struct hv_device *device);
+int netvsc_send(struct net_device *net,
+		struct hv_netvsc_packet *packet,
+		struct rndis_message *rndis_msg,
+		struct hv_page_buffer *page_buffer,
+		struct sk_buff *skb,
+		bool xdp_tx);
+void netvsc_linkstatus_callback(struct net_device *net,
+				struct rndis_message *resp,
+				void *data, u32 data_buflen);
+int netvsc_recv_callback(struct net_device *net,
+			 struct netvsc_device *nvdev,
+			 struct netvsc_channel *nvchan);
+void netvsc_channel_cb(void *context);
+int netvsc_poll(struct napi_struct *napi, int budget);
+
+void netvsc_xdp_xmit(struct sk_buff *skb, struct net_device *ndev);
+u32 netvsc_run_xdp(struct net_device *ndev, struct netvsc_channel *nvchan,
+		   struct xdp_buff *xdp);
+unsigned int netvsc_xdp_fraglen(unsigned int len);
+struct bpf_prog *netvsc_xdp_get(struct netvsc_device *nvdev);
+int netvsc_xdp_set(struct net_device *dev, struct bpf_prog *prog,
+		   struct netlink_ext_ack *extack,
+		   struct netvsc_device *nvdev);
+int netvsc_vf_setxdp(struct net_device *vf_netdev, struct bpf_prog *prog);
+int netvsc_bpf(struct net_device *dev, struct netdev_bpf *bpf);
+int netvsc_ndoxdp_xmit(struct net_device *ndev, int n,
+		       struct xdp_frame **frames, u32 flags);
+
+int rndis_set_subchannel(struct net_device *ndev,
+			 struct netvsc_device *nvdev,
+			 struct netvsc_device_info *dev_info);
+int rndis_filter_open(struct netvsc_device *nvdev);
+int rndis_filter_close(struct netvsc_device *nvdev);
+struct netvsc_device *rndis_filter_device_add(struct hv_device *dev,
+					      struct netvsc_device_info *info);
+void rndis_filter_update(struct netvsc_device *nvdev);
+void rndis_filter_device_remove(struct hv_device *dev,
+				struct netvsc_device *nvdev);
+int rndis_filter_set_rss_param(struct rndis_device *rdev,
+			       const u8 *key);
+int rndis_filter_set_offload_params(struct net_device *ndev,
+				    struct netvsc_device *nvdev,
+				    struct ndis_offload_params *req_offloads);
+int rndis_filter_receive(struct net_device *ndev,
+			 struct netvsc_device *net_dev,
+			 struct netvsc_channel *nvchan,
+			 void *data, u32 buflen);
+
+int rndis_filter_set_device_mac(struct netvsc_device *ndev,
+				const char *mac);
+
+int netvsc_switch_datapath(struct net_device *nv_dev, bool vf);
 
 #define NVSP_INVALID_PROTOCOL_VERSION	((u32)0xFFFFFFFF)
 
@@ -445,19 +562,20 @@ union nvsp_1_message_uber {
  * Network VSP protocol version 2 messages:
  */
 struct nvsp_2_vsc_capability {
-	u64 data;
+	union {
+		u64 data;
+		struct {
+			u64 vmq:1;
+			u64 chimney:1;
+			u64 sriov:1;
+			u64 ieee8021q:1;
+			u64 correlation_id:1;
+			u64 teaming:1;
+			u64 vsubnetid:1;
+			u64 rsc:1;
+		};
+	};
 } __packed;
-
-/* Bitfield accessors for nvsp_2_vsc_capability.data:
- *   bit 0: vmq
- *   bit 1: chimney
- *   bit 2: sriov
- *   bit 3: ieee8021q
- *   bit 4: correlation_id
- *   bit 5: teaming
- *   bit 6: vsubnetid
- *   bit 7: rsc
- */
 
 struct nvsp_2_send_ndis_config {
 	u32 mtu;
@@ -695,13 +813,16 @@ struct nvsp_6_pd_api_comp {
 struct nvsp_6_pd_buf {
 	u32 region_offset;
 	u16 region_id;
-	u16 flags; /* bit 0: is_partial, bits 1-15: reserved */
+	u16 is_partial:1;
+	u16 reserved:15;
 } __packed;
 
 struct nvsp_6_pd_batch_msg {
 	struct nvsp_message_header hdr;
 	u16 count;
-	u16 flags; /* bit 0: guest2host, bit 1: is_recv, bits 2-15: reserved */
+	u16 guest2host:1;
+	u16 is_recv:1;
+	u16 reserved:14;
 	struct nvsp_6_pd_buf pd_buf[0];
 } __packed;
 
@@ -725,8 +846,11 @@ struct nvsp_message {
 	union nvsp_all_messages msg;
 } __packed;
 
-#define NETVSC_MTU 65535
 
+#define NETVSC_MTU 65535
+#define NETVSC_MTU_MIN ETH_MIN_MTU
+
+/* Max buffer sizes allowed by a host */
 #define NETVSC_RECEIVE_BUFFER_SIZE		(1024 * 1024 * 31) /* 31MB */
 #define NETVSC_RECEIVE_BUFFER_SIZE_LEGACY	(1024 * 1024 * 15) /* 15MB */
 #define NETVSC_RECEIVE_BUFFER_DEFAULT		(1024 * 1024 * 16)
@@ -750,6 +874,10 @@ struct nvsp_message {
 #define NETVSC_RECEIVE_BUFFER_ID		0xcafe
 #define NETVSC_SEND_BUFFER_ID			0
 
+#define NETVSC_SUPPORTED_HW_FEATURES (NETIF_F_RXCSUM | NETIF_F_IP_CSUM | \
+				      NETIF_F_TSO | NETIF_F_IPV6_CSUM | \
+				      NETIF_F_TSO6 | NETIF_F_LRO | \
+				      NETIF_F_SG | NETIF_F_RXHASH)
 
 #define VRSS_SEND_TAB_SIZE 16  /* must be power of 2 */
 #define VRSS_CHANNEL_MAX 64
@@ -758,13 +886,315 @@ struct nvsp_message {
 #define RNDIS_MAX_PKT_DEFAULT 8
 #define RNDIS_PKT_ALIGN_DEFAULT 8
 
+#define NETVSC_XDP_HDRM 256
+
+#define NETVSC_MIN_OUT_MSG_SIZE (sizeof(struct vmpacket_descriptor) + \
+				 sizeof(struct nvsp_message))
+#define NETVSC_MIN_IN_MSG_SIZE sizeof(struct vmpacket_descriptor)
+
+/* Maximum # of contiguous data ranges that can make up a trasmitted packet.
+ * Typically it's the max SKB fragments plus 2 for the rndis packet and the
+ * linear portion of the SKB. But if MAX_SKB_FRAGS is large, the value may
+ * need to be limited to MAX_PAGE_BUFFER_COUNT, which is the max # of entries
+ * in a GPA direct packet sent to netvsp over VMBus.
+ */
+#if MAX_SKB_FRAGS + 2 < MAX_PAGE_BUFFER_COUNT
+#define MAX_DATA_RANGES (MAX_SKB_FRAGS + 2)
+#else
+#define MAX_DATA_RANGES MAX_PAGE_BUFFER_COUNT
+#endif
+
+/* Estimated requestor size:
+ * out_ring_size/min_out_msg_size + in_ring_size/min_in_msg_size
+ */
+static inline u32 netvsc_rqstor_size(unsigned long ringbytes)
+{
+	return ringbytes / NETVSC_MIN_OUT_MSG_SIZE +
+		ringbytes / NETVSC_MIN_IN_MSG_SIZE;
+}
+
+/* XFER PAGE packets can specify a maximum of 375 ranges for NDIS >= 6.0
+ * and a maximum of 64 ranges for NDIS < 6.0 with no RSC; with RSC, this
+ * limit is raised to 562 (= NVSP_RSC_MAX).
+ */
+#define NETVSC_MAX_XFER_PAGE_RANGES NVSP_RSC_MAX
+#define NETVSC_XFER_HEADER_SIZE(rng_cnt) \
+		(offsetof(struct vmtransfer_page_packet_header, ranges) + \
+		(rng_cnt) * sizeof(struct vmtransfer_page_range))
+#define NETVSC_MAX_PKT_SIZE (NETVSC_XFER_HEADER_SIZE(NETVSC_MAX_XFER_PAGE_RANGES) + \
+		sizeof(struct nvsp_message) + (sizeof(u32) * VRSS_SEND_TAB_SIZE))
+
+struct multi_send_data {
+	struct sk_buff *skb; /* skb containing the pkt */
+	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
+	u32 count; /* counter of batched packets */
+};
 
 struct recv_comp_data {
 	u64 tid; /* transaction id */
 	u32 status;
 };
 
+struct multi_recv_comp {
+	struct recv_comp_data *slots;
+	u32 first;	/* first data entry */
+	u32 next;	/* next entry for writing */
+};
+
 #define NVSP_RSC_MAX 562 /* Max #RSC frags in a vmbus xfer page pkt */
+
+struct nvsc_rsc {
+	struct ndis_pkt_8021q_info vlan;
+	struct ndis_tcp_ip_checksum_info csum_info;
+	u32 hash_info;
+	u8 ppi_flags; /* valid/present bits for the above PPIs */
+	u8 is_last; /* last RNDIS msg in a vmtransfer_page */
+	u32 cnt; /* #fragments in an RSC packet */
+	u32 pktlen; /* Full packet length */
+	void *data[NVSP_RSC_MAX];
+	u32 len[NVSP_RSC_MAX];
+};
+
+#define NVSC_RSC_VLAN		BIT(0)	/* valid/present bit for 'vlan' */
+#define NVSC_RSC_CSUM_INFO	BIT(1)	/* valid/present bit for 'csum_info' */
+#define NVSC_RSC_HASH_INFO	BIT(2)	/* valid/present bit for 'hash_info' */
+
+struct netvsc_stats_tx {
+	u64 packets;
+	u64 bytes;
+	u64 xdp_xmit;
+	struct u64_stats_sync syncp;
+};
+
+struct netvsc_stats_rx {
+	u64 packets;
+	u64 bytes;
+	u64 broadcast;
+	u64 multicast;
+	u64 xdp_drop;
+	u64 xdp_redirect;
+	u64 xdp_tx;
+	struct u64_stats_sync syncp;
+};
+
+struct netvsc_ethtool_stats {
+	unsigned long tx_scattered;
+	unsigned long tx_no_memory;
+	unsigned long tx_no_space;
+	unsigned long tx_too_big;
+	unsigned long tx_busy;
+	unsigned long tx_send_full;
+	unsigned long rx_comp_busy;
+	unsigned long rx_no_memory;
+	unsigned long stop_queue;
+	unsigned long wake_queue;
+	unsigned long vlan_error;
+};
+
+struct netvsc_ethtool_pcpu_stats {
+	u64     rx_packets;
+	u64     rx_bytes;
+	u64     tx_packets;
+	u64     tx_bytes;
+	u64     vf_rx_packets;
+	u64     vf_rx_bytes;
+	u64     vf_tx_packets;
+	u64     vf_tx_bytes;
+};
+
+struct netvsc_vf_pcpu_stats {
+	u64     rx_packets;
+	u64     rx_bytes;
+	u64     tx_packets;
+	u64     tx_bytes;
+	struct u64_stats_sync   syncp;
+	u32	tx_dropped;
+};
+
+struct netvsc_reconfig {
+	struct list_head list;
+	u32 event;
+};
+
+/* L4 hash bits for different protocols */
+#define HV_TCP4_L4HASH 1
+#define HV_TCP6_L4HASH 2
+#define HV_UDP4_L4HASH 4
+#define HV_UDP6_L4HASH 8
+#define HV_DEFAULT_L4HASH (HV_TCP4_L4HASH | HV_TCP6_L4HASH | HV_UDP4_L4HASH | \
+			   HV_UDP6_L4HASH)
+
+/* The context of the netvsc device  */
+struct net_device_context {
+	/* point back to our device context */
+	struct hv_device *device_ctx;
+	/* netvsc_device */
+	struct netvsc_device __rcu *nvdev;
+	/* list of netvsc net_devices */
+	struct list_head list;
+	/* reconfigure work */
+	struct delayed_work dwork;
+	/* last reconfig time */
+	unsigned long last_reconfig;
+	/* reconfig events */
+	struct list_head reconfig_events;
+	/* list protection */
+	spinlock_t lock;
+
+	u32 msg_enable; /* debug level */
+
+	u32 tx_checksum_mask;
+
+	u32 tx_table[VRSS_SEND_TAB_SIZE];
+
+	u16 *rx_table;
+
+	u32 rx_table_sz;
+
+	/* Ethtool settings */
+	u8 duplex;
+	u32 speed;
+	u32 l4_hash; /* L4 hash settings */
+	struct netvsc_ethtool_stats eth_stats;
+
+	/* State to manage the associated VF interface. */
+	struct net_device __rcu *vf_netdev;
+	struct netvsc_vf_pcpu_stats __percpu *vf_stats;
+	struct delayed_work vf_takeover;
+	struct delayed_work vfns_work;
+
+	/* 1: allocated, serial number is valid. 0: not allocated */
+	u32 vf_alloc;
+	/* Serial number of the VF to team with */
+	u32 vf_serial;
+	/* completion variable to confirm vf association */
+	struct completion vf_add;
+	/* Is the current data path through the VF NIC? */
+	bool  data_path_is_vf;
+
+	/* Used to temporarily save the config info across hibernation */
+	struct netvsc_device_info *saved_netvsc_dev_info;
+};
+
+void netvsc_vfns_work(struct work_struct *w);
+
+/* Azure hosts don't support non-TCP port numbers in hashing for fragmented
+ * packets. We can use ethtool to change UDP hash level when necessary.
+ */
+static inline u32 netvsc_get_hash(struct sk_buff *skb,
+				  const struct net_device_context *ndc)
+{
+	struct flow_keys flow;
+	u32 hash, pkt_proto = 0;
+	static u32 hashrnd __read_mostly;
+
+	net_get_random_once(&hashrnd, sizeof(hashrnd));
+
+	if (!skb_flow_dissect_flow_keys(skb, &flow, 0))
+		return 0;
+
+	switch (flow.basic.ip_proto) {
+	case IPPROTO_TCP:
+		if (flow.basic.n_proto == htons(ETH_P_IP))
+			pkt_proto = HV_TCP4_L4HASH;
+		else if (flow.basic.n_proto == htons(ETH_P_IPV6))
+			pkt_proto = HV_TCP6_L4HASH;
+
+		break;
+
+	case IPPROTO_UDP:
+		if (flow.basic.n_proto == htons(ETH_P_IP))
+			pkt_proto = HV_UDP4_L4HASH;
+		else if (flow.basic.n_proto == htons(ETH_P_IPV6))
+			pkt_proto = HV_UDP6_L4HASH;
+
+		break;
+	}
+
+	if (pkt_proto & ndc->l4_hash) {
+		return skb_get_hash(skb);
+	} else {
+		if (flow.basic.n_proto == htons(ETH_P_IP))
+			hash = jhash2((u32 *)&flow.addrs.v4addrs, 2, hashrnd);
+		else if (flow.basic.n_proto == htons(ETH_P_IPV6))
+			hash = jhash2((u32 *)&flow.addrs.v6addrs, 8, hashrnd);
+		else
+			return 0;
+
+		__skb_set_sw_hash(skb, hash, false);
+	}
+
+	return hash;
+}
+
+/* Per channel data */
+struct netvsc_channel {
+	struct vmbus_channel *channel;
+	struct netvsc_device *net_device;
+	void *recv_buf; /* buffer to copy packets out from the receive buffer */
+	const struct vmpacket_descriptor *desc;
+	struct napi_struct napi;
+	struct multi_send_data msd;
+	struct multi_recv_comp mrc;
+	atomic_t queue_sends;
+	struct nvsc_rsc rsc;
+
+	struct bpf_prog __rcu *bpf_prog;
+	struct xdp_rxq_info xdp_rxq;
+	bool xdp_flush;
+
+	struct netvsc_stats_tx tx_stats;
+	struct netvsc_stats_rx rx_stats;
+};
+
+/* Per netvsc device */
+struct netvsc_device {
+	u32 nvsp_version;
+
+	wait_queue_head_t wait_drain;
+	bool destroy;
+	bool tx_disable; /* if true, do not wake up queue again */
+
+	/* Receive buffer allocated by us but manages by NetVSP */
+	void *recv_buf;
+	u32 recv_buf_size; /* allocated bytes */
+	struct vmbus_gpadl recv_buf_gpadl_handle;
+	u32 recv_section_cnt;
+	u32 recv_section_size;
+	u32 recv_completion_cnt;
+
+	/* Send buffer allocated by us */
+	void *send_buf;
+	u32 send_buf_size;
+	struct vmbus_gpadl send_buf_gpadl_handle;
+	u32 send_section_cnt;
+	u32 send_section_size;
+	unsigned long *send_section_map;
+
+	/* Used for NetVSP initialization protocol */
+	struct completion channel_init_wait;
+	struct nvsp_message channel_init_pkt;
+
+	struct nvsp_message revoke_packet;
+
+	u32 max_chn;
+	u32 num_chn;
+
+	u32 netvsc_gso_max_size;
+
+	atomic_t open_chn;
+	struct work_struct subchan_work;
+	wait_queue_head_t subchan_open;
+
+	struct rndis_device *extension;
+
+	u32 max_pkt; /* max number of pkt in one send, e.g. 8 */
+	u32 pkt_align; /* alignment bytes, e.g. 8 */
+
+	struct netvsc_channel chan_table[VRSS_CHANNEL_MAX];
+
+	struct rcu_head rcu;
+};
 
 /* NdisInitialize message */
 struct rndis_initialize_request {
@@ -927,9 +1357,9 @@ enum rndis_per_pkt_info_interal_type {
 	RNDIS_PKTINFO_MAX
 };
 
-#define RNDIS_PKTINFO_SUBALLOC (1 << 0)
-#define RNDIS_PKTINFO_1ST_FRAG (1 << 1)
-#define RNDIS_PKTINFO_LAST_FRAG (1 << 2)
+#define RNDIS_PKTINFO_SUBALLOC BIT(0)
+#define RNDIS_PKTINFO_1ST_FRAG BIT(1)
+#define RNDIS_PKTINFO_LAST_FRAG BIT(2)
 
 #define RNDIS_PKTINFO_ID_V1 1
 
@@ -1382,57 +1812,10 @@ struct rndis_message {
 #define TRANSPORT_INFO_IPV6_TCP 0x10
 #define TRANSPORT_INFO_IPV6_UDP 0x20
 
-/* RNDIS message types (from linux/rndis.h) */
-#define RNDIS_MSG_PACKET          0x00000001
-#define RNDIS_MSG_INDICATE        0x00000007
-#define RNDIS_MSG_INIT            0x00000002
-#define RNDIS_MSG_INIT_C          0x80000002
-#define RNDIS_MSG_HALT            0x00000003
-#define RNDIS_MSG_QUERY           0x00000004
-#define RNDIS_MSG_QUERY_C         0x80000004
-#define RNDIS_MSG_SET             0x00000005
-#define RNDIS_MSG_SET_C           0x80000005
-#define RNDIS_MSG_RESET           0x00000006
-#define RNDIS_MSG_RESET_C         0x80000006
-#define RNDIS_MSG_KEEPALIVE       0x00000008
-#define RNDIS_MSG_KEEPALIVE_C     0x80000008
+#define RETRY_US_LO	5000
+#define RETRY_US_HI	10000
+#define RETRY_MAX	2000	/* >10 sec */
 
-/* RNDIS status values */
-#define RNDIS_STATUS_SUCCESS            0x00000000
-#define RNDIS_STATUS_PENDING            0x00000103
-#define RNDIS_STATUS_MEDIA_CONNECT      0x4001000B
-#define RNDIS_STATUS_MEDIA_DISCONNECT   0x4001000C
-#define RNDIS_STATUS_NETWORK_CHANGE     0x40010018
-#define RNDIS_STATUS_FAILURE            0xC0000001
-#define RNDIS_STATUS_NOT_SUPPORTED      0xC00000BB
-#define RNDIS_STATUS_RESOURCES          0xC000009A
-#define RNDIS_STATUS_INVALID_DATA       0xC0010015
-
-/* Common NDIS OIDs */
-#define OID_GEN_SUPPORTED_LIST          0x00010101
-#define OID_GEN_HARDWARE_STATUS         0x00010102
-#define OID_GEN_MEDIA_SUPPORTED         0x00010103
-#define OID_GEN_MEDIA_IN_USE            0x00010104
-#define OID_GEN_MAXIMUM_LOOKAHEAD       0x00010105
-#define OID_GEN_MAXIMUM_FRAME_SIZE      0x00010106
-#define OID_GEN_LINK_SPEED              0x00010107
-#define OID_GEN_TRANSMIT_BUFFER_SPACE   0x00010108
-#define OID_GEN_RECEIVE_BUFFER_SPACE    0x00010109
-#define OID_GEN_TRANSMIT_BLOCK_SIZE     0x0001010A
-#define OID_GEN_RECEIVE_BLOCK_SIZE      0x0001010B
-#define OID_GEN_VENDOR_ID               0x0001010C
-#define OID_GEN_VENDOR_DESCRIPTION      0x0001010D
-#define OID_GEN_CURRENT_PACKET_FILTER   0x0001010E
-#define OID_GEN_CURRENT_LOOKAHEAD       0x0001010F
-#define OID_GEN_DRIVER_VERSION          0x00010110
-#define OID_GEN_MAXIMUM_TOTAL_SIZE      0x00010111
-#define OID_GEN_MAC_OPTIONS             0x00010113
-#define OID_GEN_MEDIA_CONNECT_STATUS    0x00010114
-#define OID_GEN_MAXIMUM_SEND_PACKETS    0x00010115
-#define OID_GEN_LINK_SPEED_EX           0x00010120
-#define OID_802_3_PERMANENT_ADDRESS     0x01010101
-#define OID_802_3_CURRENT_ADDRESS       0x01010102
-#define OID_802_3_MAXIMUM_LIST_SIZE     0x01010103
-#define OID_802_3_MULTICAST_LIST        0x01010104
-
+void netvsc_dma_unmap(struct hv_device *hv_dev,
+		      struct hv_netvsc_packet *packet);
 #endif /* _HYPERV_NET_H */
