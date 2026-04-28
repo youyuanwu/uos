@@ -7,3 +7,6 @@ edition = "2021"
 embclox-dma.workspace = true
 embclox-hal-x86.workspace = true
 log.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true

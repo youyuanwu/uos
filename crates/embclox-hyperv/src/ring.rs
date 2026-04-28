@@ -20,6 +20,9 @@ pub struct VmPacketDescriptor {
 }
 
 pub const VM_PKT_DATA_INBAND: u16 = 6;
+pub const VM_PKT_DATA_USING_XFER_PAGES: u16 = 7;
+pub const VM_PKT_DATA_USING_GPA_DIRECT: u16 = 8;
+pub const VM_PKT_COMP: u16 = 11;
 pub const VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED: u16 = 1;
 
 /// One half of a VMBus ring buffer (send or receive).
@@ -172,6 +175,140 @@ impl RingHalf {
         Ok(())
     }
 
+    /// Write a VMBus completion packet (VM_PKT_COMP, type 11) to the send ring.
+    /// Used to acknowledge receipt of xfer page packets from the host.
+    pub fn send_comp(&self, payload: &[u8], transaction_id: u64) -> Result<(), RingError> {
+        let header_size = 16usize;
+        let packet_len = align8(header_size + payload.len());
+        let total_write = packet_len + 8;
+
+        let write_idx = self.read_write_index() as usize;
+        let read_idx = self.read_read_index() as usize;
+        fence(Ordering::Acquire);
+
+        let avail = if write_idx >= read_idx {
+            self.data_size - (write_idx - read_idx)
+        } else {
+            read_idx - write_idx
+        };
+
+        if avail <= total_write {
+            return Err(RingError::Full);
+        }
+
+        let desc = VmPacketDescriptor {
+            packet_type: VM_PKT_COMP,
+            offset8: (header_size / 8) as u16,
+            len8: (packet_len / 8) as u16,
+            flags: 0,
+            transaction_id,
+        };
+
+        let desc_bytes =
+            unsafe { core::slice::from_raw_parts(&desc as *const _ as *const u8, header_size) };
+
+        let mut pos = unsafe { self.copy_to(write_idx, desc_bytes) };
+        if !payload.is_empty() {
+            pos = unsafe { self.copy_to(pos, payload) };
+        }
+
+        let pad = packet_len - header_size - payload.len();
+        if pad > 0 {
+            let zeros = [0u8; 8];
+            pos = unsafe { self.copy_to(pos, &zeros[..pad]) };
+        }
+
+        let prev = ((write_idx as u64) << 32) | (read_idx as u64);
+        unsafe { self.copy_to(pos, &prev.to_le_bytes()) };
+
+        fence(Ordering::Release);
+        self.set_write_index(((write_idx + total_write) % self.data_size) as u32);
+
+        Ok(())
+    }
+    ///
+    /// The packet has type `VM_PKT_DATA_USING_GPA_DIRECT` (8) with a page buffer
+    /// descriptor pointing to physical memory containing the data. The `user_data`
+    /// (e.g., NVSP header) follows after the page buffer entries.
+    pub fn send_packet_with_page_buffer(
+        &self,
+        user_data: &[u8],
+        page_pfn: u64,
+        page_offset: u32,
+        page_len: u32,
+        transaction_id: u64,
+        flags: u16,
+    ) -> Result<(), RingError> {
+        // Packet layout:
+        //   VmPacketDescriptor (16 bytes) — type=8
+        //   reserved (4 bytes)
+        //   rangecount (4 bytes) = 1
+        //   PageBuffer: len(4) + offset(4) + pfn(8) = 16 bytes
+        //   user_data (NVSP header, padded to 8 bytes)
+        let header_size = 16 + 4 + 4 + 16; // 40 bytes before user_data
+        let packet_len = align8(header_size + user_data.len());
+        let total_write = packet_len + 8;
+
+        let write_idx = self.read_write_index() as usize;
+        let read_idx = self.read_read_index() as usize;
+        fence(Ordering::Acquire);
+
+        let avail = if write_idx >= read_idx {
+            self.data_size - (write_idx - read_idx)
+        } else {
+            read_idx - write_idx
+        };
+
+        if avail <= total_write {
+            return Err(RingError::Full);
+        }
+
+        // Build the packet header
+        let data_offset8 = (header_size / 8) as u16;
+        let desc = VmPacketDescriptor {
+            packet_type: VM_PKT_DATA_USING_GPA_DIRECT,
+            offset8: data_offset8,
+            len8: (packet_len / 8) as u16,
+            flags,
+            transaction_id,
+        };
+
+        let desc_bytes = unsafe { core::slice::from_raw_parts(&desc as *const _ as *const u8, 16) };
+        let mut pos = unsafe { self.copy_to(write_idx, desc_bytes) };
+
+        // reserved + rangecount
+        let reserved: u32 = 0;
+        pos = unsafe { self.copy_to(pos, &reserved.to_le_bytes()) };
+        let rangecount: u32 = 1;
+        pos = unsafe { self.copy_to(pos, &rangecount.to_le_bytes()) };
+
+        // Page buffer entry (hv_mpb_array): offset(4) + len(4) + pfn(8)
+        pos = unsafe { self.copy_to(pos, &page_offset.to_le_bytes()) };
+        pos = unsafe { self.copy_to(pos, &page_len.to_le_bytes()) };
+        pos = unsafe { self.copy_to(pos, &page_pfn.to_le_bytes()) };
+
+        // User data (NVSP header)
+        if !user_data.is_empty() {
+            pos = unsafe { self.copy_to(pos, user_data) };
+        }
+
+        // Zero-pad to 8-byte alignment
+        let pad = packet_len - header_size - user_data.len();
+        if pad > 0 {
+            let zeros = [0u8; 8];
+            pos = unsafe { self.copy_to(pos, &zeros[..pad]) };
+        }
+
+        // Trailing prev_indices
+        let prev = ((write_idx as u64) << 32) | (read_idx as u64);
+        unsafe { self.copy_to(pos, &prev.to_le_bytes()) };
+
+        fence(Ordering::Release);
+        self.set_write_index(((write_idx + total_write) % self.data_size) as u32);
+
+        Ok(())
+    }
+
     /// Read a packet from the receive ring.
     ///
     /// Copies the payload into `buf` and returns `(descriptor, payload_len)`.
@@ -233,6 +370,56 @@ impl RingHalf {
         }
 
         // Advance read index past packet + trailing indices
+        fence(Ordering::Release);
+        self.set_read_index(((read_idx + total_read) % self.data_size) as u32);
+
+        Ok(Some((desc, copy_len)))
+    }
+
+    /// Read a raw packet from the receive ring, returning ALL bytes after
+    /// the 16-byte descriptor (including transfer page headers for type 7).
+    /// The caller uses `desc.offset8` to find the payload within the returned data.
+    pub fn recv_packet_raw(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<Option<(VmPacketDescriptor, usize)>, RingError> {
+        let write_idx = self.read_write_index() as usize;
+        fence(Ordering::Acquire);
+        let read_idx = self.read_read_index() as usize;
+
+        let avail = if write_idx >= read_idx {
+            write_idx - read_idx
+        } else {
+            self.data_size - (read_idx - write_idx)
+        };
+
+        if avail == 0 {
+            return Ok(None);
+        }
+        if avail < 16 {
+            return Err(RingError::Corrupt);
+        }
+
+        let mut desc_bytes = [0u8; 16];
+        let pos = unsafe { self.copy_from(read_idx, &mut desc_bytes) };
+
+        let desc =
+            unsafe { core::ptr::read_unaligned(desc_bytes.as_ptr() as *const VmPacketDescriptor) };
+
+        let packet_len = (desc.len8 as usize) * 8;
+        let total_read = packet_len + 8;
+
+        if packet_len < 16 || total_read > avail {
+            return Err(RingError::Corrupt);
+        }
+
+        // Copy ALL bytes after the 16-byte descriptor
+        let raw_len = packet_len - 16;
+        let copy_len = raw_len.min(buf.len());
+        if copy_len > 0 {
+            unsafe { self.copy_from(pos, &mut buf[..copy_len]) };
+        }
+
         fence(Ordering::Release);
         self.set_read_index(((read_idx + total_read) % self.data_size) as u32);
 

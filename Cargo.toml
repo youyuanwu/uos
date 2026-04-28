@@ -60,6 +60,7 @@ spin = "0.10"
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+bindgen = "0.72"
 
 [profile.dev]
 panic = "abort"

@@ -5,186 +5,43 @@
 //! Phase 3: Packet send/recv (RNDIS_PACKET_MSG).
 
 use crate::channel::{self, Channel};
+use crate::ffi;
 use crate::guid;
+use crate::nvsp_msg::{
+    build_nvsp_init, build_nvsp_send_ndis_config, build_nvsp_send_ndis_version,
+    build_nvsp_send_recv_buf, build_nvsp_send_rndis_pkt, build_nvsp_send_send_buf,
+    build_rndis_init, build_rndis_query, build_rndis_set, nvsp_message_as_bytes,
+    parse_nvsp_response, parse_rndis_response, rndis_message_as_bytes, NvspResponse, RndisResponse,
+    RNDIS_HEADER_SIZE,
+};
+use crate::nvsp_types::{
+    NdisOid, NdisPacketFilter, NvspMessageType, NvspVersion, RndisMessageType, VmbusPacketType,
+};
 use crate::HvError;
 use crate::VmBus;
 use embclox_dma::{DmaAllocator, DmaRegion};
 use embclox_hal_x86::memory::MemoryMapper;
 use log::*;
 
-// ── NVSP message types ──────────────────────────────────────────────────
-
-const NVSP_MSG_TYPE_INIT: u32 = 1;
-const NVSP_MSG_TYPE_INIT_COMPLETE: u32 = 2;
-const NVSP_MSG1_TYPE_SEND_NDIS_VER: u32 = 100;
-const NVSP_MSG1_TYPE_SEND_RECV_BUF: u32 = 101;
-const NVSP_MSG1_TYPE_SEND_SEND_BUF: u32 = 104;
-const NVSP_MSG1_TYPE_SEND_RNDIS_PKT: u32 = 107;
-const NVSP_MSG1_TYPE_SEND_RNDIS_PKT_COMPLETE: u32 = 108;
-
-// NVSPv2+ message types
-const NVSP_MSG2_TYPE_SEND_NDIS_CONFIG: u32 = 196;
-
-// NVSP protocol versions
-const NVSP_PROTOCOL_VERSION_5: u32 = 0x30002; // WIN2012R2+
-const NVSP_PROTOCOL_VERSION_4: u32 = 0x30001; // WIN2012
-const NVSP_PROTOCOL_VERSION_1: u32 = 0x00002; // WIN2008
-
-// NVSP receive buffer ID (arbitrary, must be non-zero)
-const NETVSC_RECEIVE_BUFFER_ID: u16 = 0xCAFE;
-const NETVSC_SEND_BUFFER_ID: u16 = 0xBEEF;
-
-// Buffer sizes
+// Buffer sizes (our chosen allocation sizes, not protocol constants)
 const NETVSC_RECV_BUF_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 const NETVSC_SEND_BUF_SIZE: usize = 1024 * 1024; // 1 MB
 const NETVSC_RING_SIZE: usize = 256 * 1024; // 256 KB (128 KB × 2)
 
-// ── RNDIS constants ─────────────────────────────────────────────────────
-
-const RNDIS_MSG_INIT: u32 = 0x0000_0002;
-const RNDIS_MSG_INIT_CMPLT: u32 = 0x8000_0002;
-const RNDIS_MSG_QUERY: u32 = 0x0000_0004;
-const RNDIS_MSG_QUERY_CMPLT: u32 = 0x8000_0004;
-const RNDIS_MSG_SET: u32 = 0x0000_0005;
-const RNDIS_MSG_SET_CMPLT: u32 = 0x8000_0005;
-const RNDIS_MSG_PACKET: u32 = 0x0000_0001;
-const RNDIS_MSG_KEEPALIVE: u32 = 0x0000_0008;
-const RNDIS_MSG_KEEPALIVE_CMPLT: u32 = 0x8000_0008;
-
-// OIDs
-const OID_802_3_PERMANENT_ADDRESS: u32 = 0x0101_0101;
-const OID_GEN_MAXIMUM_FRAME_SIZE: u32 = 0x0001_0106;
-const OID_GEN_CURRENT_PACKET_FILTER: u32 = 0x0001_010E;
-
-// Packet filter flags
-const NDIS_PACKET_TYPE_DIRECTED: u32 = 0x01;
-const NDIS_PACKET_TYPE_MULTICAST: u32 = 0x02;
-const NDIS_PACKET_TYPE_BROADCAST: u32 = 0x08;
-
-// RNDIS_PACKET_MSG header size (44 bytes)
-const RNDIS_PACKET_HDR_SIZE: usize = 44;
-
-// ── NVSP message helpers ────────────────────────────────────────────────
-
-// NvspMessage layout: msg_type(4) + body(variable), no padding.
-// The host expects sizeof(nvsp_message) = 64 bytes minimum for all messages.
-const NVSP_MESSAGE_SIZE: usize = 64;
-
-/// Build an NVSP_MSG_TYPE_INIT message (padded to 64 bytes).
-fn build_nvsp_init(version: u32, buf: &mut [u8]) -> usize {
-    assert!(buf.len() >= NVSP_MESSAGE_SIZE);
-    buf[..NVSP_MESSAGE_SIZE].fill(0);
-    buf[0..4].copy_from_slice(&NVSP_MSG_TYPE_INIT.to_le_bytes());
-    buf[4..8].copy_from_slice(&version.to_le_bytes());
-    buf[8..12].copy_from_slice(&version.to_le_bytes());
-    NVSP_MESSAGE_SIZE
-}
-
-/// Build NVSP_MSG1_TYPE_SEND_RECV_BUF message (padded to 64 bytes).
-fn build_nvsp_send_recv_buf(gpadl_handle: u32, id: u16, buf: &mut [u8]) -> usize {
-    assert!(buf.len() >= NVSP_MESSAGE_SIZE);
-    buf[..NVSP_MESSAGE_SIZE].fill(0);
-    buf[0..4].copy_from_slice(&NVSP_MSG1_TYPE_SEND_RECV_BUF.to_le_bytes());
-    buf[4..8].copy_from_slice(&gpadl_handle.to_le_bytes());
-    buf[8..10].copy_from_slice(&id.to_le_bytes());
-    NVSP_MESSAGE_SIZE
-}
-
-/// Build NVSP_MSG1_TYPE_SEND_SEND_BUF message (padded to 64 bytes).
-fn build_nvsp_send_send_buf(gpadl_handle: u32, id: u16, buf: &mut [u8]) -> usize {
-    assert!(buf.len() >= NVSP_MESSAGE_SIZE);
-    buf[..NVSP_MESSAGE_SIZE].fill(0);
-    buf[0..4].copy_from_slice(&NVSP_MSG1_TYPE_SEND_SEND_BUF.to_le_bytes());
-    buf[4..8].copy_from_slice(&gpadl_handle.to_le_bytes());
-    buf[8..10].copy_from_slice(&id.to_le_bytes());
-    NVSP_MESSAGE_SIZE
-}
-
-/// Build NVSP_MSG1_TYPE_SEND_RNDIS_PKT message (padded to 64 bytes).
-/// channel_type: 1 = control, 0 = data
-fn build_nvsp_send_rndis_pkt(
-    channel_type: u32,
-    send_buf_section_idx: u32,
-    send_buf_section_size: u32,
-    buf: &mut [u8],
-) -> usize {
-    assert!(buf.len() >= NVSP_MESSAGE_SIZE);
-    buf[..NVSP_MESSAGE_SIZE].fill(0);
-    buf[0..4].copy_from_slice(&NVSP_MSG1_TYPE_SEND_RNDIS_PKT.to_le_bytes());
-    buf[4..8].copy_from_slice(&channel_type.to_le_bytes());
-    buf[8..12].copy_from_slice(&send_buf_section_idx.to_le_bytes());
-    buf[12..16].copy_from_slice(&send_buf_section_size.to_le_bytes());
-    NVSP_MESSAGE_SIZE
-}
-
-/// Parse NVSP message type from received payload.
-fn parse_nvsp_type(payload: &[u8]) -> Option<u32> {
-    if payload.len() < 4 {
-        return None;
-    }
-    Some(u32::from_le_bytes(payload[0..4].try_into().unwrap()))
-}
-
-// ── RNDIS message helpers ───────────────────────────────────────────────
-
-/// Build RNDIS_INITIALIZE_MSG.
-fn build_rndis_init(request_id: u32, buf: &mut [u8]) -> usize {
-    // hdr: msg_type(4) + msg_len(4) + request_id(4) + major(4) + minor(4) + max_xfer(4)
-    let len = 24;
-    assert!(buf.len() >= len);
-    buf[..len].fill(0);
-    buf[0..4].copy_from_slice(&RNDIS_MSG_INIT.to_le_bytes());
-    buf[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-    buf[8..12].copy_from_slice(&request_id.to_le_bytes());
-    buf[12..16].copy_from_slice(&1u32.to_le_bytes()); // major version
-    buf[16..20].copy_from_slice(&0u32.to_le_bytes()); // minor version
-    buf[20..24].copy_from_slice(&0x4000u32.to_le_bytes()); // max xfer size (16KB)
-    len
-}
-
-/// Build RNDIS_QUERY_MSG.
-fn build_rndis_query(request_id: u32, oid: u32, buf: &mut [u8]) -> usize {
-    // hdr: msg_type(4) + msg_len(4) + request_id(4) + oid(4)
-    //      + info_buf_len(4) + info_buf_offset(4) + device_vc_handle(4)
-    let len = 28;
-    assert!(buf.len() >= len);
-    buf[..len].fill(0);
-    buf[0..4].copy_from_slice(&RNDIS_MSG_QUERY.to_le_bytes());
-    buf[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-    buf[8..12].copy_from_slice(&request_id.to_le_bytes());
-    buf[12..16].copy_from_slice(&oid.to_le_bytes());
-    // info_buf_len, info_buf_offset, device_vc_handle = 0
-    len
-}
-
-/// Build RNDIS_SET_MSG with a u32 value.
-fn build_rndis_set_u32(request_id: u32, oid: u32, value: u32, buf: &mut [u8]) -> usize {
-    // hdr(8) + request_id(4) + oid(4) + info_buf_len(4) + info_buf_offset(4) + vc_handle(4)
-    // + value(4)
-    let len = 32;
-    assert!(buf.len() >= len);
-    buf[..len].fill(0);
-    buf[0..4].copy_from_slice(&RNDIS_MSG_SET.to_le_bytes());
-    buf[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-    buf[8..12].copy_from_slice(&request_id.to_le_bytes());
-    buf[12..16].copy_from_slice(&oid.to_le_bytes());
-    buf[16..20].copy_from_slice(&4u32.to_le_bytes()); // info_buf_len = 4
-    buf[20..24].copy_from_slice(&20u32.to_le_bytes()); // info_buf_offset = 20 (from &request_id)
-                                                       // vc_handle = 0
-    buf[28..32].copy_from_slice(&value.to_le_bytes());
-    len
-}
+// RNDIS_PACKET_MSG header: rndis_packet struct + 8-byte RNDIS header
+const RNDIS_PACKET_HDR_SIZE: usize = core::mem::size_of::<ffi::rndis_packet>() + RNDIS_HEADER_SIZE;
 
 /// Build RNDIS_KEEPALIVE_CMPLT response.
+///
+/// This is a response we send back to the host (not a request), so we keep
+/// a local builder using the KeepAliveComplete message type.
 fn build_rndis_keepalive_cmplt(request_id: u32, buf: &mut [u8]) -> usize {
-    // msg_type(4) + msg_len(4) + request_id(4) + status(4)
-    let len = 16;
-    assert!(buf.len() >= len);
+    let len = 16; // msg_type(4) + msg_len(4) + request_id(4) + status(4)
     buf[..len].fill(0);
-    buf[0..4].copy_from_slice(&RNDIS_MSG_KEEPALIVE_CMPLT.to_le_bytes());
+    buf[0..4].copy_from_slice(&RndisMessageType::KeepAliveComplete.as_u32().to_le_bytes());
     buf[4..8].copy_from_slice(&(len as u32).to_le_bytes());
     buf[8..12].copy_from_slice(&request_id.to_le_bytes());
-    // status = 0 (success)
+    // status = RNDIS_STATUS_SUCCESS (0)
     len
 }
 
@@ -214,6 +71,13 @@ pub struct NetvscDevice {
     mtu: u32,
     next_request_id: u32,
     next_txid: u64,
+    // Response slot for synchronous RNDIS control messages.
+    // Only one control message in flight at a time (like Linux's channel_init_pkt).
+    ctrl_resp: [u8; 256],
+    ctrl_resp_len: usize,
+    ctrl_resp_ready: bool,
+    // Track send buffer section availability
+    send_section_free: bool,
 }
 
 impl NetvscDevice {
@@ -244,6 +108,19 @@ impl NetvscDevice {
         let nvsp_version = Self::negotiate_nvsp_version(&channel)?;
         info!("NetVSC: NVSP version {:#x} negotiated", nvsp_version);
 
+        // Send NDIS version (fire-and-forget, per Linux netvsc_connect_vsp)
+        {
+            // NDIS 6.30 for NVSPv5+, NDIS 6.1 for v4 and below
+            let (major, minor) = if nvsp_version > NvspVersion::V4.as_u32() {
+                (6, 30)
+            } else {
+                (6, 1)
+            };
+            let msg = build_nvsp_send_ndis_version(major, minor);
+            channel.send_raw(nvsp_message_as_bytes(&msg), 98)?;
+            info!("NetVSC: sent NDIS_VER {}.{}", major, minor);
+        }
+
         // Allocate and register receive buffer
         let recv_buf = dma.alloc_coherent(NETVSC_RECV_BUF_SIZE, 4096);
         let recv_pfns = pfn_list(&recv_buf);
@@ -263,31 +140,32 @@ impl NetvscDevice {
         );
 
         // Send NVSP_MSG1_TYPE_SEND_RECV_BUF
-        let mut msg = [0u8; NVSP_MESSAGE_SIZE];
-        let len = build_nvsp_send_recv_buf(recv_gpadl, NETVSC_RECEIVE_BUFFER_ID, &mut msg);
-        channel.send(&msg[..len], 1)?;
+        let msg =
+            build_nvsp_send_recv_buf(recv_gpadl, crate::nvsp_types::buffer::RECEIVE_BUFFER_ID);
+        channel.send(nvsp_message_as_bytes(&msg), 1)?;
 
         // Wait for SEND_RECV_BUF_COMPLETE (may arrive as completion type 11 with payload)
         let mut resp = [0u8; 256];
         let resp_len = loop {
-            let (_desc, len) = channel.recv_with_timeout(&mut resp, 50_000_000)?;
+            let (desc, len) = channel.recv_with_timeout(&mut resp, 50_000_000)?;
+            info!(
+                "NetVSC: buf_setup recv: type={} off8={} len8={} txid={} payload={}",
+                desc.packet_type, desc.offset8, desc.len8, desc.transaction_id, len
+            );
             if len > 0 {
                 break len;
             }
         };
-        // RECV_BUF_COMPLETE: msg_type(4) + status(4) + num_sections(4) + ...
-        // NVSP_STAT_SUCCESS = 1
-        let recv_status = if resp_len >= 8 {
-            u32::from_le_bytes(resp[4..8].try_into().unwrap())
+        if let Some(NvspResponse::RecvBufComplete { status, .. }) =
+            parse_nvsp_response(&resp[..resp_len])
+        {
+            if status != ffi::NVSP_STAT_SUCCESS {
+                error!("NetVSC: recv buffer setup failed: status {:#x}", status);
+                return Err(HvError::HypercallFailed(status as u16));
+            }
         } else {
-            0xFFFF
-        };
-        if recv_status != 1 {
-            error!(
-                "NetVSC: recv buffer setup failed: status {:#x}",
-                recv_status
-            );
-            return Err(HvError::HypercallFailed(recv_status as u16));
+            error!("NetVSC: recv buffer setup: unexpected response");
+            return Err(HvError::HypercallFailed(0xFFFF));
         }
         info!("NetVSC: recv buffer registered");
 
@@ -310,8 +188,8 @@ impl NetvscDevice {
         );
 
         // Send NVSP_MSG1_TYPE_SEND_SEND_BUF
-        let len = build_nvsp_send_send_buf(send_gpadl, NETVSC_SEND_BUFFER_ID, &mut msg);
-        channel.send(&msg[..len], 2)?;
+        let msg = build_nvsp_send_send_buf(send_gpadl, crate::nvsp_types::buffer::SEND_BUFFER_ID);
+        channel.send(nvsp_message_as_bytes(&msg), 2)?;
 
         // Wait for SEND_SEND_BUF_COMPLETE (may arrive as completion type 11 with payload)
         let resp_len = loop {
@@ -320,46 +198,24 @@ impl NetvscDevice {
                 break len;
             }
         };
-        // SEND_BUF_COMPLETE: msg_type(4) + status(4) + section_size(4)
-        // (msg_type=105, NVSP_STAT_SUCCESS=1)
-        let send_status = if resp_len >= 8 {
-            u32::from_le_bytes(resp[4..8].try_into().unwrap())
+        let send_section_size = if let Some(NvspResponse::SendBufComplete {
+            status,
+            section_size,
+        }) = parse_nvsp_response(&resp[..resp_len])
+        {
+            if status != ffi::NVSP_STAT_SUCCESS {
+                error!("NetVSC: send buffer setup failed: status {:#x}", status);
+                return Err(HvError::HypercallFailed(status as u16));
+            }
+            section_size
         } else {
-            0xFFFF
-        };
-        if send_status != 1 {
-            error!(
-                "NetVSC: send buffer setup failed: status {:#x}",
-                send_status
-            );
-            return Err(HvError::HypercallFailed(send_status as u16));
-        }
-        let send_section_size = if resp_len >= 12 {
-            u32::from_le_bytes(resp[8..12].try_into().unwrap())
-        } else {
-            0
+            error!("NetVSC: send buffer setup: unexpected response");
+            return Err(HvError::HypercallFailed(0xFFFF));
         };
         info!(
             "NetVSC: send buffer registered, section_size={}",
             send_section_size
         );
-
-        // Send NDIS config and version (fire-and-forget, after buffer setup)
-        if nvsp_version > NVSP_PROTOCOL_VERSION_1 {
-            let mut ndis_msg = [0u8; NVSP_MESSAGE_SIZE];
-            ndis_msg[0..4].copy_from_slice(&NVSP_MSG2_TYPE_SEND_NDIS_CONFIG.to_le_bytes());
-            let mtu_with_hdr: u32 = 1514 + 14;
-            ndis_msg[4..8].copy_from_slice(&mtu_with_hdr.to_le_bytes());
-            ndis_msg[8..12].copy_from_slice(&1u32.to_le_bytes()); // ieee8021q=1
-            channel.send_raw(&ndis_msg, 0)?;
-        }
-        {
-            let mut ndis_msg = [0u8; NVSP_MESSAGE_SIZE];
-            ndis_msg[0..4].copy_from_slice(&NVSP_MSG1_TYPE_SEND_NDIS_VER.to_le_bytes());
-            ndis_msg[4..8].copy_from_slice(&0x0006u32.to_le_bytes()); // NDIS 6.30
-            ndis_msg[8..12].copy_from_slice(&0x001eu32.to_le_bytes());
-            channel.send_raw(&ndis_msg, 0)?;
-        }
 
         info!("NetVSC: NVSP init complete");
 
@@ -376,9 +232,26 @@ impl NetvscDevice {
             mtu: 1514,
             next_request_id: 1,
             next_txid: 100,
+            ctrl_resp: [0; 256],
+            ctrl_resp_len: 0,
+            ctrl_resp_ready: false,
+            send_section_free: true,
         };
 
         dev.rndis_init()?;
+
+        // Drain TX completions and unsolicited messages before next control
+        for _ in 0..10_000_000u64 {
+            if !dev.poll_channel()? {
+                // No more packets — wait a bit and try once more
+                for _ in 0..100_000 {
+                    core::hint::spin_loop();
+                }
+                dev.poll_channel()?;
+                break;
+            }
+        }
+
         dev.rndis_query_mac()?;
         dev.rndis_query_mtu()?;
         dev.rndis_set_packet_filter()?;
@@ -409,33 +282,30 @@ impl NetvscDevice {
     // ── NVSP version negotiation ────────────────────────────────────
 
     fn negotiate_nvsp_version(channel: &Channel) -> Result<u32, HvError> {
-        let versions = [
-            NVSP_PROTOCOL_VERSION_5,
-            NVSP_PROTOCOL_VERSION_4,
-            NVSP_PROTOCOL_VERSION_1,
-        ];
-        for &ver in &versions {
-            let mut msg = [0u8; NVSP_MESSAGE_SIZE];
-            let len = build_nvsp_init(ver, &mut msg);
-            channel.send(&msg[..len], 0)?;
+        // Try from highest to lowest
+        for &ver in NvspVersion::NEGOTIATE_ORDER {
+            let msg = build_nvsp_init(ver.as_u32());
+            channel.send(nvsp_message_as_bytes(&msg), 0)?;
 
             let mut resp = [0u8; 256];
             let (_desc, resp_len) = channel.recv_with_timeout(&mut resp, 5_000_000)?;
 
-            if let Some(NVSP_MSG_TYPE_INIT_COMPLETE) = parse_nvsp_type(&resp[..resp_len]) {
-                // INIT_COMPLETE: msg_type(4) + negotiated_ver(4) + max_mdl(4) + status(4)
-                // NVSP_STAT_SUCCESS = 1
-                let status = if resp_len >= 16 {
-                    u32::from_le_bytes(resp[12..16].try_into().unwrap())
-                } else {
-                    0
-                };
-                if status == 1 {
-                    return Ok(ver);
+            if let Some(NvspResponse::InitComplete { status, .. }) =
+                parse_nvsp_response(&resp[..resp_len])
+            {
+                if status == ffi::NVSP_STAT_SUCCESS {
+                    // Version accepted.
+                    // For NVSPv2+: send NDIS_CONFIG (fire-and-forget, like Linux)
+                    if ver != NvspVersion::V1 {
+                        let mtu: u32 = 1514 + 14; // MTU + ETH_HLEN
+                        let cfg = build_nvsp_send_ndis_config(mtu, 1); // ieee8021q=1
+                        channel.send_raw(nvsp_message_as_bytes(&cfg), 99)?;
+                    }
+                    return Ok(ver.as_u32());
                 }
                 trace!(
                     "NetVSC: NVSP version {:#x} rejected (status={})",
-                    ver,
+                    ver.as_u32(),
                     status
                 );
             }
@@ -447,75 +317,221 @@ impl NetvscDevice {
 
     /// Send an RNDIS control message via the send buffer.
     fn send_rndis_control(&mut self, rndis_msg: &[u8]) -> Result<(), HvError> {
-        // Write RNDIS message to the start of the send buffer
+        info!(
+            "NetVSC: send_rndis_control: len={} type={:#x}",
+            rndis_msg.len(),
+            if rndis_msg.len() >= 4 {
+                u32::from_le_bytes(rndis_msg[0..4].try_into().unwrap())
+            } else {
+                0
+            }
+        );
+        // Wait for send buffer section 0 to be free
+        if !self.send_section_free {
+            for _ in 0..50_000_000u64 {
+                self.poll_channel()?;
+                if self.send_section_free {
+                    break;
+                }
+                for _ in 0..100 {
+                    core::hint::spin_loop();
+                }
+            }
+            if !self.send_section_free {
+                error!("NetVSC: send section timeout");
+                return Err(HvError::Timeout);
+            }
+        }
+
         assert!(rndis_msg.len() <= NETVSC_SEND_BUF_SIZE);
         let dst = self.send_buf.vaddr as *mut u8;
         unsafe {
             core::ptr::copy_nonoverlapping(rndis_msg.as_ptr(), dst, rndis_msg.len());
         }
 
-        // Wrap in NVSP_MSG1_TYPE_SEND_RNDIS_PKT (channel_type=1 for control)
-        let mut nvsp = [0u8; 64];
-        let nvsp_len = build_nvsp_send_rndis_pkt(
-            1, // control channel
-            0, // send buffer section index 0
-            rndis_msg.len() as u32,
-            &mut nvsp,
-        );
+        let nvsp = build_nvsp_send_rndis_pkt(1, 0, rndis_msg.len() as u32);
+        let bytes = nvsp_message_as_bytes(&nvsp);
 
+        self.send_section_free = false; // Mark section as in use
         let txid = self.next_txid;
         self.next_txid += 1;
-        self.channel.send(&nvsp[..nvsp_len], txid)
+        self.channel.send(bytes, txid)
     }
 
-    /// Receive an RNDIS control response.
-    /// The response arrives as a completion with NVSP data, then a separate
-    /// in-band SEND_RNDIS_PKT message with transfer pages pointing to recv_buf.
+    // ── Channel dispatch loop ────────────────────────────────────
+
+    /// Poll the VMBus channel and dispatch all pending packets.
+    /// Returns true if any packet was processed.
+    fn poll_channel(&mut self) -> Result<bool, HvError> {
+        let mut raw = [0u8; 512];
+        let mut processed = false;
+
+        while let Some((desc, raw_len)) = self.channel.try_recv_raw(&mut raw)? {
+            processed = true;
+            info!(
+                "NetVSC: poll: pkt type={} off8={} len8={} raw_len={} txid={}",
+                desc.packet_type, desc.offset8, desc.len8, raw_len, desc.transaction_id
+            );
+            match VmbusPacketType::from_u16(desc.packet_type) {
+                Some(VmbusPacketType::DataUsingXferPages) => {
+                    self.handle_xfer_page(&desc, &raw[..raw_len])?;
+                }
+                Some(VmbusPacketType::Completion) => {
+                    // TX completion — check if NVSP SEND_RNDIS_PKT_COMPLETE
+                    let nvsp_offset = (desc.offset8 as usize) * 8 - 16;
+                    if nvsp_offset < raw_len && raw_len >= nvsp_offset + 4 {
+                        let msg_type = u32::from_le_bytes(
+                            raw[nvsp_offset..nvsp_offset + 4].try_into().unwrap(),
+                        );
+                        if msg_type == NvspMessageType::SendRndisPktComplete.as_u32() {
+                            self.send_section_free = true;
+                        }
+                    }
+                }
+                Some(VmbusPacketType::DataInBand) => {
+                    if raw_len >= 4 {
+                        let nvsp_offset = (desc.offset8 as usize) * 8 - 16;
+                        if nvsp_offset < raw_len {
+                            let nvsp_type = u32::from_le_bytes(
+                                raw[nvsp_offset..nvsp_offset + 4].try_into().unwrap(),
+                            );
+                            info!("NetVSC: poll: in-band NVSP type={}", nvsp_type);
+                        }
+                    }
+                }
+                _ => {
+                    info!("NetVSC: poll: unknown pkt type={}", desc.packet_type);
+                }
+            }
+        }
+        Ok(processed)
+    }
+
+    /// Handle a VM_PKT_DATA_USING_XFER_PAGES packet from the host.
+    fn handle_xfer_page(
+        &mut self,
+        desc: &crate::ring::VmPacketDescriptor,
+        raw: &[u8],
+    ) -> Result<(), HvError> {
+        let mut buf = [0u8; 256];
+        let len = self.parse_xfer_page_packet(raw, &mut buf);
+        info!(
+            "NetVSC: xfer page: len={} rndis_type={:#x}",
+            len,
+            if len >= 4 {
+                u32::from_le_bytes(buf[0..4].try_into().unwrap())
+            } else {
+                0
+            }
+        );
+
+        // Send recv completion back to host (VM_PKT_COMP)
+        let mut comp = [0u8; 8];
+        comp[0..4].copy_from_slice(&NvspMessageType::SendRndisPktComplete.as_u32().to_le_bytes());
+        comp[4..8].copy_from_slice(&ffi::NVSP_STAT_SUCCESS.to_le_bytes());
+        let _ = self.channel.send_completion(&comp, desc.transaction_id);
+
+        if len < RNDIS_HEADER_SIZE {
+            return Ok(());
+        }
+
+        match parse_rndis_response(&buf[..len]) {
+            // Control responses → store in ctrl_resp slot
+            Some(
+                RndisResponse::InitComplete { .. }
+                | RndisResponse::QueryComplete { .. }
+                | RndisResponse::SetComplete { .. },
+            ) => {
+                info!(
+                    "NetVSC: ctrl response len={} data={:02x?}",
+                    len,
+                    &buf[..len.min(40)]
+                );
+                let copy_len = len.min(self.ctrl_resp.len());
+                self.ctrl_resp[..copy_len].copy_from_slice(&buf[..copy_len]);
+                self.ctrl_resp_len = copy_len;
+                self.ctrl_resp_ready = true;
+            }
+            // Keepalive → respond immediately
+            Some(RndisResponse::KeepAliveComplete { req_id, .. }) => {
+                let mut resp = [0u8; 16];
+                let rlen = build_rndis_keepalive_cmplt(req_id, &mut resp);
+                let _ = self.send_rndis_control_inner(&resp[..rlen]);
+            }
+            // Unsolicited (INDICATE_STATUS, data packets, etc.) → skip during init
+            _ => {
+                let rndis_type = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+                trace!("NetVSC: skipping RNDIS type {:#x}", rndis_type);
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait for a RNDIS control response by polling the channel dispatch loop.
     fn recv_rndis_response(&mut self, buf: &mut [u8]) -> Result<usize, HvError> {
-        for _ in 0..50_000_000u64 {
-            if let Some((_desc, len)) = self.channel.try_recv(buf)? {
-                if len < 4 {
-                    continue;
-                }
-                let nvsp_type = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-                match nvsp_type {
-                    NVSP_MSG1_TYPE_SEND_RNDIS_PKT_COMPLETE => {
-                        // TX completion — skip
-                        continue;
-                    }
-                    NVSP_MSG1_TYPE_SEND_RNDIS_PKT => {
-                        // Host sent RNDIS data via recv buffer.
-                        // Read RNDIS message from recv buffer offset 0
-                        // (host writes control responses at start of recv buf)
-                        let recv_ptr = self._recv_buf.vaddr as *const u8;
-                        let rndis_len = unsafe {
-                            u32::from_le_bytes(
-                                core::slice::from_raw_parts(recv_ptr.add(4), 4)
-                                    .try_into()
-                                    .unwrap(),
-                            )
-                        } as usize;
-                        if rndis_len == 0 || rndis_len > NETVSC_RECV_BUF_SIZE {
-                            warn!("NetVSC: invalid RNDIS len {} in recv buf", rndis_len);
-                            continue;
-                        }
-                        let copy_len = rndis_len.min(buf.len());
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(recv_ptr, buf.as_mut_ptr(), copy_len);
-                        }
-                        return Ok(copy_len);
-                    }
-                    _ => {
-                        // Other NVSP types — skip
-                        continue;
-                    }
-                }
+        self.ctrl_resp_ready = false;
+        for i in 0..100_000_000u64 {
+            self.poll_channel()?;
+            if self.ctrl_resp_ready {
+                let len = self.ctrl_resp_len.min(buf.len());
+                buf[..len].copy_from_slice(&self.ctrl_resp[..len]);
+                self.ctrl_resp_ready = false;
+                return Ok(len);
+            }
+            if i > 0 && i % 10_000_000 == 0 {
+                info!(
+                    "NetVSC: waiting for RNDIS response... ({}M iterations)",
+                    i / 1_000_000
+                );
             }
             for _ in 0..100 {
                 core::hint::spin_loop();
             }
         }
+        error!("NetVSC: RNDIS response timeout after 100M iterations");
         Err(HvError::Timeout)
+    }
+
+    /// Parse a VM_PKT_DATA_USING_XFER_PAGES packet and copy RNDIS data from recv buffer.
+    /// raw[0..] is everything after the 16-byte VmPacketDescriptor:
+    ///   [0..2] xfer_pageset_id (u16)
+    ///   [2]    sender_owns_set (u8)
+    ///   [3]    reserved (u8)
+    ///   [4..8] range_cnt (u32)
+    ///   [8..]  ranges as vmtransfer_page_range (byte_count + byte_offset) * range_cnt
+    fn parse_xfer_page_packet(&self, raw: &[u8], out: &mut [u8]) -> usize {
+        if raw.len() < 8 {
+            return 0;
+        }
+
+        let range_cnt = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+        if range_cnt == 0
+            || raw.len() < 8 + range_cnt * core::mem::size_of::<ffi::vmtransfer_page_range>()
+        {
+            return 0;
+        }
+
+        // Cast first range (RNDIS responses are typically single-range)
+        let range = unsafe { &*(raw[8..].as_ptr() as *const ffi::vmtransfer_page_range) };
+        let byte_count = range.byte_count as usize;
+        let byte_offset = range.byte_offset as usize;
+
+        if byte_offset + byte_count > NETVSC_RECV_BUF_SIZE || byte_count == 0 {
+            warn!(
+                "NetVSC: xfer page range out of bounds: off={} len={}",
+                byte_offset, byte_count
+            );
+            return 0;
+        }
+
+        // Copy RNDIS data from recv buffer
+        let recv_ptr = self._recv_buf.vaddr as *const u8;
+        let copy_len = byte_count.min(out.len());
+        unsafe {
+            core::ptr::copy_nonoverlapping(recv_ptr.add(byte_offset), out.as_mut_ptr(), copy_len);
+        }
+
+        copy_len
     }
 
     // ── RNDIS init sequence ─────────────────────────────────────────
@@ -524,27 +540,30 @@ impl NetvscDevice {
         let req_id = self.next_request_id;
         self.next_request_id += 1;
 
-        let mut msg = [0u8; 64];
-        let len = build_rndis_init(req_id, &mut msg);
-        self.send_rndis_control(&msg[..len])?;
+        let msg = build_rndis_init(req_id, 0x4000);
+        let msg_bytes = rndis_message_as_bytes(&msg);
+        let send_len = msg.msg_len as usize;
+        info!(
+            "NetVSC: sending RNDIS_INIT req_id={} msg_len={} struct_size={}",
+            req_id,
+            send_len,
+            msg_bytes.len()
+        );
+        self.send_rndis_control(&msg_bytes[..send_len])?;
 
         let mut resp = [0u8; 256];
         let resp_len = self.recv_rndis_response(&mut resp)?;
 
-        if resp_len >= 4 {
-            let rndis_type = u32::from_le_bytes(resp[0..4].try_into().unwrap());
-            if rndis_type != RNDIS_MSG_INIT_CMPLT {
-                error!("NetVSC: expected RNDIS INIT_CMPLT, got {:#x}", rndis_type);
-                return Err(HvError::VersionRejected);
+        match parse_rndis_response(&resp[..resp_len]) {
+            Some(RndisResponse::InitComplete { status, .. }) => {
+                if !status.is_success() {
+                    error!("NetVSC: RNDIS init failed: status {}", status);
+                    return Err(HvError::HypercallFailed(status.0 as u16));
+                }
             }
-        }
-
-        // Check status at offset 12..16
-        if resp_len >= 16 {
-            let status = u32::from_le_bytes(resp[12..16].try_into().unwrap());
-            if status != 0 {
-                error!("NetVSC: RNDIS init failed: status {:#x}", status);
-                return Err(HvError::HypercallFailed(status as u16));
+            _ => {
+                error!("NetVSC: expected RNDIS INIT_CMPLT");
+                return Err(HvError::VersionRejected);
             }
         }
 
@@ -553,41 +572,43 @@ impl NetvscDevice {
     }
 
     fn rndis_query_mac(&mut self) -> Result<(), HvError> {
-        let req_id = self.next_request_id;
-        self.next_request_id += 1;
+        // Try current address first, then permanent
+        for oid in [NdisOid::ETH_CURRENT_ADDRESS, NdisOid::ETH_PERMANENT_ADDRESS] {
+            let req_id = self.next_request_id;
+            self.next_request_id += 1;
 
-        let mut msg = [0u8; 64];
-        let len = build_rndis_query(req_id, OID_802_3_PERMANENT_ADDRESS, &mut msg);
-        self.send_rndis_control(&msg[..len])?;
+            let mut msg = [0u8; 64];
+            let len = build_rndis_query(req_id, oid, &[], &mut msg);
+            self.send_rndis_control(&msg[..len])?;
 
-        let mut resp = [0u8; 256];
-        let resp_len = self.recv_rndis_response(&mut resp)?;
+            let mut resp = [0u8; 256];
+            let resp_len = self.recv_rndis_response(&mut resp)?;
 
-        if resp_len >= 4 {
-            let rndis_type = u32::from_le_bytes(resp[0..4].try_into().unwrap());
-            if rndis_type != RNDIS_MSG_QUERY_CMPLT {
-                error!("NetVSC: expected QUERY_CMPLT, got {:#x}", rndis_type);
-                return Err(HvError::VersionRejected);
+            match parse_rndis_response(&resp[..resp_len]) {
+                Some(RndisResponse::QueryComplete { status, info, .. }) => {
+                    if !status.is_success() {
+                        info!("NetVSC: OID {} failed: status {}", oid, status);
+                        continue;
+                    }
+                    if info.len() >= 6 {
+                        self.mac.copy_from_slice(&info[..6]);
+                        info!(
+                            "NetVSC: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({})",
+                            self.mac[0],
+                            self.mac[1],
+                            self.mac[2],
+                            self.mac[3],
+                            self.mac[4],
+                            self.mac[5],
+                            oid,
+                        );
+                        return Ok(());
+                    }
+                }
+                _ => continue,
             }
         }
-
-        // RNDIS_QUERY_CMPLT layout:
-        //   hdr(8) + request_id(4) + status(4) + info_buf_len(4) + info_buf_offset(4)
-        // info_buf_offset is from &request_id (offset 8 in message)
-        if resp_len >= 24 {
-            let info_buf_len = u32::from_le_bytes(resp[16..20].try_into().unwrap()) as usize;
-            let info_buf_offset = u32::from_le_bytes(resp[20..24].try_into().unwrap()) as usize;
-            // info buffer is at offset 8 + info_buf_offset (from start of message)
-            let data_start = 8 + info_buf_offset;
-            if info_buf_len >= 6 && data_start + 6 <= resp_len {
-                self.mac.copy_from_slice(&resp[data_start..data_start + 6]);
-                info!(
-                    "NetVSC: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                    self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5],
-                );
-            }
-        }
-
+        warn!("NetVSC: could not query MAC address, using default");
         Ok(())
     }
 
@@ -596,23 +617,18 @@ impl NetvscDevice {
         self.next_request_id += 1;
 
         let mut msg = [0u8; 64];
-        let len = build_rndis_query(req_id, OID_GEN_MAXIMUM_FRAME_SIZE, &mut msg);
+        let len = build_rndis_query(req_id, NdisOid::GEN_MAXIMUM_FRAME_SIZE, &[], &mut msg);
         self.send_rndis_control(&msg[..len])?;
 
         let mut resp = [0u8; 256];
         let resp_len = self.recv_rndis_response(&mut resp)?;
 
-        if resp_len >= 24 {
-            let rndis_type = u32::from_le_bytes(resp[0..4].try_into().unwrap());
-            if rndis_type == RNDIS_MSG_QUERY_CMPLT {
-                let info_buf_len = u32::from_le_bytes(resp[16..20].try_into().unwrap()) as usize;
-                let info_buf_offset = u32::from_le_bytes(resp[20..24].try_into().unwrap()) as usize;
-                let data_start = 8 + info_buf_offset;
-                if info_buf_len >= 4 && data_start + 4 <= resp_len {
-                    self.mtu =
-                        u32::from_le_bytes(resp[data_start..data_start + 4].try_into().unwrap());
-                    info!("NetVSC: MTU={}", self.mtu);
-                }
+        if let Some(RndisResponse::QueryComplete { status, info, .. }) =
+            parse_rndis_response(&resp[..resp_len])
+        {
+            if status.is_success() && info.len() >= 4 {
+                self.mtu = u32::from_le_bytes(info[0..4].try_into().unwrap());
+                info!("NetVSC: MTU={}", self.mtu);
             }
         }
 
@@ -623,29 +639,29 @@ impl NetvscDevice {
         let req_id = self.next_request_id;
         self.next_request_id += 1;
 
-        let filter =
-            NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_MULTICAST | NDIS_PACKET_TYPE_BROADCAST;
+        let filter_val = NdisPacketFilter::STANDARD.0;
 
         let mut msg = [0u8; 64];
-        let len = build_rndis_set_u32(req_id, OID_GEN_CURRENT_PACKET_FILTER, filter, &mut msg);
+        let len = build_rndis_set(
+            req_id,
+            NdisOid::GEN_CURRENT_PACKET_FILTER,
+            &filter_val.to_le_bytes(),
+            &mut msg,
+        );
         self.send_rndis_control(&msg[..len])?;
 
         let mut resp = [0u8; 256];
         let resp_len = self.recv_rndis_response(&mut resp)?;
 
-        if resp_len >= 4 {
-            let rndis_type = u32::from_le_bytes(resp[0..4].try_into().unwrap());
-            if rndis_type != RNDIS_MSG_SET_CMPLT {
-                error!("NetVSC: expected SET_CMPLT, got {:#x}", rndis_type);
-                return Err(HvError::VersionRejected);
+        match parse_rndis_response(&resp[..resp_len]) {
+            Some(RndisResponse::SetComplete { status, .. }) => {
+                if !status.is_success() {
+                    warn!("NetVSC: set packet filter status: {}", status);
+                }
             }
-        }
-
-        // Check status
-        if resp_len >= 16 {
-            let status = u32::from_le_bytes(resp[12..16].try_into().unwrap());
-            if status != 0 {
-                warn!("NetVSC: set packet filter status: {:#x}", status);
+            _ => {
+                error!("NetVSC: expected SET_CMPLT");
+                return Err(HvError::VersionRejected);
             }
         }
 
@@ -663,25 +679,19 @@ impl NetvscDevice {
         // Build RNDIS_PACKET_MSG header + frame in send buffer
         let dst = self.send_buf.vaddr as *mut u8;
         unsafe {
-            // Zero the header
-            core::ptr::write_bytes(dst, 0, RNDIS_PACKET_HDR_SIZE);
-            // msg_type
-            core::ptr::copy_nonoverlapping(RNDIS_MSG_PACKET.to_le_bytes().as_ptr(), dst, 4);
-            // msg_len
+            // Write RNDIS header (msg_type + msg_len)
+            let msg_type = RndisMessageType::Packet.as_u32();
+            core::ptr::copy_nonoverlapping(msg_type.to_le_bytes().as_ptr(), dst, 4);
             core::ptr::copy_nonoverlapping(
                 (rndis_len as u32).to_le_bytes().as_ptr(),
                 dst.add(4),
                 4,
             );
-            // data_offset = 36 (from start of data_offset field, which is at byte 8)
-            // So data starts at byte 8 + 36 = 44 = RNDIS_PACKET_HDR_SIZE
-            core::ptr::copy_nonoverlapping(36u32.to_le_bytes().as_ptr(), dst.add(8), 4);
-            // data_len
-            core::ptr::copy_nonoverlapping(
-                (frame.len() as u32).to_le_bytes().as_ptr(),
-                dst.add(12),
-                4,
-            );
+            // Write rndis_packet struct at offset 8
+            let pkt = dst.add(RNDIS_HEADER_SIZE) as *mut ffi::rndis_packet;
+            core::ptr::write_bytes(pkt, 0, 1);
+            (*pkt).data_offset = (core::mem::size_of::<ffi::rndis_packet>()) as u32;
+            (*pkt).data_len = frame.len() as u32;
             // Copy Ethernet frame after header
             core::ptr::copy_nonoverlapping(
                 frame.as_ptr(),
@@ -691,94 +701,74 @@ impl NetvscDevice {
         }
 
         // Send NVSP_MSG1_TYPE_SEND_RNDIS_PKT (channel_type=0 for data)
-        let mut nvsp = [0u8; 64];
-        let nvsp_len = build_nvsp_send_rndis_pkt(
-            0, // data channel
-            0, // send buffer section index 0
-            rndis_len as u32,
-            &mut nvsp,
-        );
+        let nvsp = build_nvsp_send_rndis_pkt(0, 0, rndis_len as u32);
+        let bytes = nvsp_message_as_bytes(&nvsp);
 
         let txid = self.next_txid;
         self.next_txid += 1;
-        self.channel.send(&nvsp[..nvsp_len], txid)
+        self.channel.send(bytes, txid)
     }
 
     /// Try to receive an Ethernet frame. Returns the frame length, or None
     /// if no frame is available.
     pub fn try_receive(&mut self, frame_buf: &mut [u8]) -> Result<Option<usize>, HvError> {
-        let mut pkt = [0u8; 256];
-        if let Some((_desc, len)) = self.channel.try_recv(&mut pkt)? {
-            if let Some(nvsp_type) = parse_nvsp_type(&pkt[..len]) {
-                match nvsp_type {
-                    NVSP_MSG1_TYPE_SEND_RNDIS_PKT => {
-                        // Data from host — extract from receive buffer
-                        return self.extract_data_frame(frame_buf);
-                    }
-                    NVSP_MSG1_TYPE_SEND_RNDIS_PKT_COMPLETE => {
-                        // TX completion — ignore
-                    }
-                    _ => {
-                        trace!("NetVSC: unexpected NVSP type {} in data path", nvsp_type);
+        let mut raw = [0u8; 512];
+        if let Some((desc, raw_len)) = self.channel.try_recv_raw(&mut raw)? {
+            match VmbusPacketType::from_u16(desc.packet_type) {
+                Some(VmbusPacketType::DataUsingXferPages) => {
+                    let rndis_len = self.parse_xfer_page_packet(&raw[..raw_len], frame_buf);
+                    // Send completion
+                    let mut comp = [0u8; 8];
+                    comp[0..4].copy_from_slice(
+                        &NvspMessageType::SendRndisPktComplete.as_u32().to_le_bytes(),
+                    );
+                    comp[4..8].copy_from_slice(&ffi::NVSP_STAT_SUCCESS.to_le_bytes());
+                    let _ = self.channel.send_completion(&comp, desc.transaction_id);
+
+                    if rndis_len > 0 {
+                        return self.extract_rndis_frame(frame_buf, rndis_len);
                     }
                 }
+                Some(VmbusPacketType::Completion | VmbusPacketType::DataInBand) => {
+                    // TX completion or control — ignore
+                }
+                _ => {}
             }
         }
         Ok(None)
     }
 
-    /// Extract a data frame from the receive buffer.
-    fn extract_data_frame(&self, frame_buf: &mut [u8]) -> Result<Option<usize>, HvError> {
-        let recv_ptr = self._recv_buf.vaddr as *const u8;
+    /// Extract Ethernet frame from an RNDIS_PACKET_MSG already in the buffer.
+    fn extract_rndis_frame(
+        &mut self,
+        buf: &mut [u8],
+        rndis_len: usize,
+    ) -> Result<Option<usize>, HvError> {
+        if rndis_len < RNDIS_HEADER_SIZE {
+            return Ok(None);
+        }
 
-        // Read RNDIS header from receive buffer
-        let rndis_type = unsafe {
-            u32::from_le_bytes(core::slice::from_raw_parts(recv_ptr, 4).try_into().unwrap())
-        };
-
-        if rndis_type == RNDIS_MSG_PACKET {
-            let data_offset = unsafe {
-                u32::from_le_bytes(
-                    core::slice::from_raw_parts(recv_ptr.add(8), 4)
-                        .try_into()
-                        .unwrap(),
-                )
-            } as usize;
-            let data_len = unsafe {
-                u32::from_le_bytes(
-                    core::slice::from_raw_parts(recv_ptr.add(12), 4)
-                        .try_into()
-                        .unwrap(),
-                )
-            } as usize;
-
-            // Data starts at offset 8 + data_offset from start of message
-            let frame_start = 8 + data_offset;
-            let copy_len = data_len.min(frame_buf.len());
-
-            if frame_start + copy_len <= NETVSC_RECV_BUF_SIZE {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        recv_ptr.add(frame_start),
-                        frame_buf.as_mut_ptr(),
-                        copy_len,
-                    );
+        match parse_rndis_response(&buf[..rndis_len]) {
+            Some(RndisResponse::Packet {
+                data_offset,
+                data_len,
+                ..
+            }) => {
+                let data_offset = data_offset as usize;
+                let data_len = data_len as usize;
+                // Data starts at offset RNDIS_HEADER_SIZE + data_offset
+                let frame_start = RNDIS_HEADER_SIZE + data_offset;
+                if frame_start + data_len <= rndis_len {
+                    buf.copy_within(frame_start..frame_start + data_len, 0);
+                    return Ok(Some(data_len));
                 }
-                return Ok(Some(copy_len));
             }
-        } else if rndis_type == RNDIS_MSG_KEEPALIVE {
-            // Respond to keepalive
-            let req_id = unsafe {
-                u32::from_le_bytes(
-                    core::slice::from_raw_parts(recv_ptr.add(8), 4)
-                        .try_into()
-                        .unwrap(),
-                )
-            };
-            let mut resp = [0u8; 16];
-            let len = build_rndis_keepalive_cmplt(req_id, &mut resp);
-            // Best-effort send
-            let _ = self.send_rndis_control_inner(&resp[..len]);
+            Some(RndisResponse::KeepAliveComplete { req_id, .. }) => {
+                let mut resp = [0u8; 16];
+                let len = build_rndis_keepalive_cmplt(req_id, &mut resp);
+                let _ = self.send_rndis_control_inner(&resp[..len]);
+            }
+            _ => {}
         }
 
         Ok(None)
@@ -791,9 +781,9 @@ impl NetvscDevice {
             core::ptr::copy_nonoverlapping(rndis_msg.as_ptr(), dst, rndis_msg.len());
         }
 
-        let mut nvsp = [0u8; 64];
-        let nvsp_len = build_nvsp_send_rndis_pkt(1, 0, rndis_msg.len() as u32, &mut nvsp);
+        let nvsp = build_nvsp_send_rndis_pkt(1, 0, rndis_msg.len() as u32);
+        let bytes = nvsp_message_as_bytes(&nvsp);
 
-        self.channel.send(&nvsp[..nvsp_len], 0)
+        self.channel.send(bytes, 0)
     }
 }

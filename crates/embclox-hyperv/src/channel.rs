@@ -105,6 +105,56 @@ impl Channel {
         Err(HvError::Timeout)
     }
 
+    /// Send a VMBus packet with a page buffer (GPA direct) for RNDIS control messages.
+    pub fn send_with_page_buffer(
+        &self,
+        user_data: &[u8],
+        page_pfn: u64,
+        page_offset: u32,
+        page_len: u32,
+        transaction_id: u64,
+    ) -> Result<(), HvError> {
+        self.send
+            .send_packet_with_page_buffer(
+                user_data,
+                page_pfn,
+                page_offset,
+                page_len,
+                transaction_id,
+                VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED,
+            )
+            .map_err(|e| {
+                error!("ring send page buf failed: {:?}", e);
+                HvError::HypercallFailed(0xFFFF)
+            })?;
+        self.signal_host();
+        Ok(())
+    }
+
+    /// Try to receive a raw packet (including transfer page headers for type 7).
+    /// Returns all bytes after the 16-byte descriptor. Use `desc.offset8` to
+    /// find the NVSP payload within the returned data.
+    pub fn try_recv_raw(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<Option<(VmPacketDescriptor, usize)>, HvError> {
+        self.recv.recv_packet_raw(buf).map_err(|e| {
+            error!("ring recv raw failed: {:?}", e);
+            HvError::HypercallFailed(0xFFFF)
+        })
+    }
+
+    /// Send a VMBus completion packet (VM_PKT_COMP, type 11) for a received xfer page packet.
+    /// The transaction_id must match the original packet's transaction_id.
+    pub fn send_completion(&self, payload: &[u8], transaction_id: u64) -> Result<(), HvError> {
+        self.send.send_comp(payload, transaction_id).map_err(|e| {
+            error!("ring send comp failed: {:?}", e);
+            HvError::HypercallFailed(0xFFFF)
+        })?;
+        self.signal_host();
+        Ok(())
+    }
+
     /// GPADL handle for this channel (for debug/logging).
     pub fn gpadl_handle(&self) -> u32 {
         self.gpadl_handle

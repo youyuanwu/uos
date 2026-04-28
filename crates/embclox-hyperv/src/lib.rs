@@ -8,6 +8,10 @@
 
 extern crate alloc;
 
+pub mod ffi;
+pub mod nvsp_msg;
+pub mod nvsp_types;
+
 pub mod channel;
 pub mod detect;
 pub mod guid;
