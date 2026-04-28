@@ -769,6 +769,14 @@ impl NetvscDevice {
             core::ptr::write_bytes(pkt, 0, 1);
             (*pkt).DataOffset = (core::mem::size_of::<ffi::rndis_packet>()) as u32;
             (*pkt).DataLength = frame_len as u32;
+            // Linux netvsc_xmit always sets PerPacketInfoOffset to point
+            // just past the rndis_packet struct (with PerPacketInfoLength=0
+            // meaning "no PPIs follow"). Some host code paths read this
+            // offset unconditionally; leaving it zero makes the host
+            // dereference offset 0 within the message, which silently
+            // corrupts/drops UDP frames (DHCP DISCOVER never gets a reply).
+            // Reference: drivers/net/hyperv/netvsc_drv.c:511-515 in Linux.
+            (*pkt).PerPacketInfoOffset = (core::mem::size_of::<ffi::rndis_packet>()) as u32;
         }
 
         // Closure fills the Ethernet payload region directly in the
