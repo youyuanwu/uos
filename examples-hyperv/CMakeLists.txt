@@ -44,7 +44,7 @@ add_custom_command(
         -efi-boot-part --efi-boot-image --protective-msdos-label
         ${CMAKE_BINARY_DIR}/hyperv-iso -o ${HYPERV_ISO}
         2>/dev/null
-    DEPENDS hyperv-build ${LIMINE_BOOTX64}
+    DEPENDS hyperv-build ${LIMINE_BOOTX64} ${CMAKE_CURRENT_SOURCE_DIR}/limine.conf
     COMMENT "Creating Hyper-V BIOS+UEFI ISO image"
 )
 add_custom_target(hyperv-image DEPENDS ${HYPERV_ISO})
@@ -65,7 +65,7 @@ add_custom_command(
         ${limine_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/limine-azure.conf
         ${HYPERV_VHD}
-    DEPENDS hyperv-build
+    DEPENDS hyperv-build ${CMAKE_CURRENT_SOURCE_DIR}/limine-azure.conf
     COMMENT "Creating Hyper-V VHD image (Azure Gen1, DHCP cmdline)"
 )
 add_custom_target(hyperv-vhd DEPENDS ${HYPERV_VHD})

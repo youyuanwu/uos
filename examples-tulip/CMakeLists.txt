@@ -44,7 +44,7 @@ add_custom_command(
         -efi-boot-part --efi-boot-image --protective-msdos-label
         ${CMAKE_BINARY_DIR}/tulip-iso -o ${TULIP_ISO}
         2>/dev/null
-    DEPENDS tulip-build ${LIMINE_BOOTX64}
+    DEPENDS tulip-build ${LIMINE_BOOTX64} ${CMAKE_CURRENT_SOURCE_DIR}/limine.conf
     COMMENT "Creating Tulip BIOS+UEFI ISO image"
 )
 add_custom_target(tulip-image DEPENDS ${TULIP_ISO})
