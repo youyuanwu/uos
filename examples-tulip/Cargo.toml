@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 limine = "0.5"
 embclox-dma.workspace = true
+embclox-hal-x86.workspace = true
 embclox-tulip.workspace = true
 embassy-executor.workspace = true
 embassy-net.workspace = true
@@ -14,7 +15,8 @@ embassy-sync.workspace = true
 embassy-time.workspace = true
 embassy-time-driver.workspace = true
 embedded-io-async.workspace = true
-critical-section = { version = "1", features = ["restore-state-bool"] }
+critical-section = "1"
+heapless = "0.9"
 log.workspace = true
 x86_64.workspace = true
 static_cell.workspace = true

@@ -78,8 +78,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut lapic_dev = LocalApic::new(_lapic_mmio.vaddr());
     lapic_dev.enable();
 
-    // Calibrate TSC via PIT
-    let tsc_per_us = embclox_hal_x86::pit::calibrate_tsc_mhz();
+    // Calibrate TSC via PIT (e1000 only runs on QEMU where PIT works).
+    let tsc_per_us = embclox_hal_x86::pit::calibrate_tsc_mhz().expect("PIT TSC calibration failed");
     embclox_hal_x86::time::set_tsc_per_us(tsc_per_us);
 
     // Register handlers

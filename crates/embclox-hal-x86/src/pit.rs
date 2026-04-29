@@ -5,8 +5,12 @@ const PIT_CMD: u16 = 0x43;
 const PIT_FREQ_HZ: u64 = 1_193_182;
 
 /// Calibrate TSC frequency using the PIT channel 2.
-/// Returns TSC ticks per microsecond.
-pub fn calibrate_tsc_mhz() -> u64 {
+///
+/// Returns `Some(tsc_ticks_per_microsecond)` on success, or `None` if
+/// the PIT channel-2 output bit never asserts within the spin budget
+/// (Hyper-V Gen1, for example, doesn't fully emulate this bit and
+/// would otherwise hang the kernel forever).
+pub fn calibrate_tsc_mhz() -> Option<u64> {
     // We'll measure how many TSC ticks elapse during a known PIT interval.
     // PIT channel 2 in one-shot mode, count = 11932 ≈ 10ms at 1.193182 MHz
 
@@ -30,16 +34,29 @@ pub fn calibrate_tsc_mhz() -> u64 {
         // Read TSC before
         let tsc_start = core::arch::x86_64::_rdtsc();
 
-        // Wait for PIT channel 2 output to go high (bit 5 of port 0x61)
+        // Wait for PIT channel 2 output to go high (bit 5 of port 0x61).
+        // Bounded — Hyper-V Gen1 doesn't emulate this bit, so we'd loop
+        // forever without the cap.
+        let mut bounded: u64 = 0;
         loop {
             if port61.read() & 0x20 != 0 {
                 break;
+            }
+            bounded += 1;
+            if bounded > 100_000_000 {
+                log::warn!("PIT calibration timed out — channel-2 output bit never asserted");
+                return None;
             }
         }
 
         let tsc_end = core::arch::x86_64::_rdtsc();
         let tsc_elapsed = tsc_end - tsc_start;
         let tsc_per_us = tsc_elapsed / expected_us;
+
+        if tsc_per_us == 0 {
+            log::warn!("PIT calibration returned zero ticks/us");
+            return None;
+        }
 
         log::info!(
             "TSC calibration: {} ticks in ~{}us → {} ticks/us (~{} MHz)",
@@ -49,6 +66,6 @@ pub fn calibrate_tsc_mhz() -> u64 {
             tsc_per_us
         );
 
-        tsc_per_us
+        Some(tsc_per_us)
     }
 }

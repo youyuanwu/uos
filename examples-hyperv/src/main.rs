@@ -12,8 +12,8 @@ use embclox_hyperv::netvsc_embassy::NetvscEmbassy;
 use embedded_io_async::Write as AsyncWrite;
 use limine::BaseRevision;
 use limine::request::{
-    FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
-    StackSizeRequest,
+    ExecutableCmdlineRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker,
+    RequestsStartMarker, StackSizeRequest,
 };
 use static_cell::StaticCell;
 use x86_64::VirtAddr;
@@ -48,6 +48,10 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(64 * 1024);
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 
 // Port I/O helpers
 
@@ -394,9 +398,31 @@ fn hcf() -> ! {
 
 // ── Phase 4b: embassy executor + embassy-net ────────────────────────────
 
+/// Default static network configuration when the cmdline doesn't specify
+/// `ip=`/`gw=`. Matches `scripts/hyperv-setup-vswitch.ps1`.
+const NET_DEFAULTS: embclox_hal_x86::cmdline::StaticDefaults =
+    embclox_hal_x86::cmdline::StaticDefaults {
+        ip: [192, 168, 234, 50],
+        prefix: 24,
+        gw: [192, 168, 234, 1],
+    };
+
+/// Read the Limine-provided kernel command line as a UTF-8 string slice.
+/// Returns "" when the bootloader didn't pass one.
+fn cmdline_str() -> &'static str {
+    if let Some(resp) = CMDLINE_REQUEST.get_response() {
+        resp.cmdline().to_str().unwrap_or("")
+    } else {
+        ""
+    }
+}
+
 /// Take ownership of an initialized [`embclox_hyperv::netvsc::NetvscDevice`]
 /// and hand it to the embassy executor. Spawns the network runner and a
 /// TCP echo server task on port 1234, then runs the executor forever.
+///
+/// Network mode (DHCP vs static) is selected by the Limine cmdline
+/// `net=` parameter — see [`embclox_hal_x86::cmdline`] and `limine.conf`.
 ///
 /// The executor uses a `hlt` between polls so the CPU goes idle when no
 /// task is ready; the SynIC SINT2 ISR (`vmbus_isr`) wakes it via
@@ -407,54 +433,50 @@ fn run_embassy(mut netvsc: embclox_hyperv::netvsc::NetvscDevice) -> ! {
     // Calibrate the TSC. Prefer the Hyper-V TSC frequency MSR (exact);
     // fall back to PIT calibration; final fallback is 2.4 GHz default.
     let tsc_per_us = read_hv_tsc_freq()
-        .or_else(calibrate_tsc_via_pit)
+        .or_else(embclox_hal_x86::pit::calibrate_tsc_mhz)
         .unwrap_or(2400);
     embclox_hal_x86::time::set_tsc_per_us(tsc_per_us);
     writeln!(serial, "PHASE4B: TSC calibrated: {} cycles/us", tsc_per_us).ok();
 
-    // Send a gratuitous ARP for our static IP so the host learns our MAC
-    // and the vSwitch starts forwarding broadcasts (incl. ARP requests
-    // from the host) to us. Standard practice for any host coming up
-    // with a static address.
-    //
-    // NOTE: On Windows hosts where Default Switch has previously assigned
-    // 172.19.192.50 to a different VM via its NAT/DHCP service, the host
-    // ARP table will contain a *Permanent* entry for that IP→old MAC.
-    // Gratuitous ARP cannot override Permanent entries; the operator must
-    // clear it (`Remove-NetNeighbor -IPAddress 172.19.192.50`, elevated)
-    // or boot the VM on a clean Default Switch state.
+    // Read the kernel cmdline that limine.conf passed (e.g. "net=dhcp"
+    // for the DHCP boot menu entry; default = static).
+    let cmdline = cmdline_str();
+    writeln!(serial, "PHASE4B: cmdline = '{}'", cmdline).ok();
+    let net_mode = embclox_hal_x86::cmdline::parse_net_mode(cmdline, NET_DEFAULTS);
+
     let mac = netvsc.mac();
-    let our_ip: [u8; 4] = [172, 19, 192, 50];
-    send_gratuitous_arp(&mut netvsc, mac, our_ip);
-    writeln!(
-        serial,
-        "PHASE4B: gratuitous ARP for {}.{}.{}.{} sent",
-        our_ip[0], our_ip[1], our_ip[2], our_ip[3]
-    )
-    .ok();
-
-    // Wrap the synthetic NIC in the embassy Driver adapter.
-    let driver = NetvscEmbassy::new(netvsc);
-
-    // embassy-net stack with a static IPv4 address.
-    //
-    // We initially used `Config::dhcpv4(Default::default())`, but Hyper-V's
-    // Default Switch DHCP server never replies to smoltcp's DISCOVER (the
-    // embedded DHCP socket hardcodes BOOTP `broadcast: false` and the
-    // Default Switch DHCP server seems to require the broadcast flag, or
-    // expects KVP integration services that we don't implement). Static
-    // configuration is sufficient to validate the embassy/embassy-net
-    // stack end-to-end via TCP echo.
-    //
-    // The address must be on the same /20 as the Default Switch's
-    // dynamically-chosen subnet (verified during Phase 3: 172.19.192.0/20,
-    // gateway 172.19.192.1). Different hosts may pick a different range;
-    // adjust if your Default Switch differs.
-    let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
-        address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(172, 19, 192, 50), 20),
-        gateway: Some(embassy_net::Ipv4Address::new(172, 19, 192, 1)),
-        dns_servers: heapless::Vec::new(),
-    });
+    let driver;
+    let config;
+    match net_mode {
+        embclox_hal_x86::cmdline::NetMode::Dhcp => {
+            // No gratuitous ARP — the DHCP DISCOVER itself announces us.
+            // Use this mode on QEMU SLIRP, Azure, External vSwitch, or
+            // anywhere a real DHCP server is available.
+            writeln!(serial, "PHASE4B: network mode = DHCPv4").ok();
+            driver = NetvscEmbassy::new(netvsc);
+            config = embassy_net::Config::dhcpv4(Default::default());
+        }
+        embclox_hal_x86::cmdline::NetMode::Static { ip, prefix, gw } => {
+            // Send a gratuitous ARP so the host learns our MAC before
+            // any TCP traffic flows.
+            send_gratuitous_arp(&mut netvsc, mac, ip);
+            writeln!(
+                serial,
+                "PHASE4B: network mode = static {}.{}.{}.{}/{} gw={}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3], prefix, gw[0], gw[1], gw[2], gw[3],
+            )
+            .ok();
+            driver = NetvscEmbassy::new(netvsc);
+            config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+                address: embassy_net::Ipv4Cidr::new(
+                    embassy_net::Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]),
+                    prefix,
+                ),
+                gateway: Some(embassy_net::Ipv4Address::new(gw[0], gw[1], gw[2], gw[3])),
+                dns_servers: heapless::Vec::new(),
+            });
+        }
+    }
     static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
@@ -520,44 +542,6 @@ fn read_hv_tsc_freq() -> Option<u64> {
     if hz == 0 { None } else { Some(hz / 1_000_000) }
 }
 
-/// Calibrate TSC frequency using PIT channel 2 (~50ms gate).
-/// Returns TSC ticks per microsecond, or None if the PIT isn't responsive.
-fn calibrate_tsc_via_pit() -> Option<u64> {
-    // PIT channel 2: gate on, mode 0 (one-shot), ~50ms
-    let count: u16 = 59659; // 1193182 Hz / 20 = ~50ms
-
-    outb(0x61, (inb(0x61) & 0x0C) | 0x01); // Gate on, speaker off
-    outb(0x43, 0xB0); // Channel 2, lobyte/hibyte, mode 0
-    outb(0x42, (count & 0xFF) as u8);
-    outb(0x42, (count >> 8) as u8);
-
-    // Reset gate to start counting
-    let gate = inb(0x61);
-    outb(0x61, gate & !0x01);
-    outb(0x61, gate | 0x01);
-
-    let start = unsafe { core::arch::x86_64::_rdtsc() };
-    // Wait for PIT output bit (bit 5 of port 0x61), bounded so we don't
-    // loop forever if the PIT doesn't respond.
-    let mut bounded = 0u64;
-    while inb(0x61) & 0x20 == 0 {
-        bounded += 1;
-        if bounded > 100_000_000 {
-            return None;
-        }
-        core::hint::spin_loop();
-    }
-    let end = unsafe { core::arch::x86_64::_rdtsc() };
-
-    let tsc_per_50ms = end - start;
-    let tsc_per_us = tsc_per_50ms / 50_000;
-    if tsc_per_us > 0 {
-        Some(tsc_per_us)
-    } else {
-        None
-    }
-}
-
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, NetvscEmbassy>) {
     runner.run().await
@@ -565,14 +549,18 @@ async fn net_task(mut runner: embassy_net::Runner<'static, NetvscEmbassy>) {
 
 #[embassy_executor::task]
 async fn echo_task(stack: &'static Stack<'static>) {
-    // With the static config the stack is ready immediately; just print
-    // it once for confirmation.
+    // Wait for an IPv4 address to be configured. With static config this
+    // is immediate; with DHCP it can take 1-3 seconds for OFFER+ACK.
     let mut serial = SerialPort::new(0x3F8);
-    if let Some(config) = stack.config_v4() {
-        let _ = writeln!(serial, "PHASE4B: IPv4 configured: {}", config.address);
-        if let Some(gw) = config.gateway {
-            let _ = writeln!(serial, "PHASE4B: gateway: {}", gw);
+    loop {
+        if let Some(config) = stack.config_v4() {
+            let _ = writeln!(serial, "PHASE4B: IPv4 configured: {}", config.address);
+            if let Some(gw) = config.gateway {
+                let _ = writeln!(serial, "PHASE4B: gateway: {}", gw);
+            }
+            break;
         }
+        embassy_time::Timer::after_millis(100).await;
     }
     let _ = writeln!(serial, "PHASE4B ECHO READY: TCP port 1234");
 

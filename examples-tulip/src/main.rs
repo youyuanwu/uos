@@ -4,8 +4,6 @@
 
 extern crate alloc;
 
-mod critical_section_impl;
-mod time;
 mod tulip_embassy;
 
 use core::arch::asm;
@@ -16,8 +14,8 @@ use embedded_io_async::Write as AsyncWrite;
 use limine::BaseRevision;
 use limine::request::ExecutableAddressRequest;
 use limine::request::{
-    FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
-    StackSizeRequest,
+    ExecutableCmdlineRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker,
+    RequestsStartMarker, StackSizeRequest,
 };
 use static_cell::StaticCell;
 use x86_64::structures::idt::InterruptStackFrame;
@@ -55,6 +53,10 @@ static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(
 #[used]
 #[unsafe(link_section = ".requests")]
 static KERNEL_ADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 
 // Port I/O helpers
 
@@ -114,48 +116,8 @@ impl Write for SerialPort {
     }
 }
 
-// Minimal bump allocator for heap
-mod heap {
-    use core::alloc::{GlobalAlloc, Layout};
-    use core::cell::UnsafeCell;
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
-    const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
-
-    struct HeapInner(UnsafeCell<[u8; HEAP_SIZE]>);
-    unsafe impl Sync for HeapInner {}
-    static HEAP: HeapInner = HeapInner(UnsafeCell::new([0; HEAP_SIZE]));
-    static OFFSET: AtomicUsize = AtomicUsize::new(0);
-
-    pub struct BumpAlloc;
-
-    unsafe impl GlobalAlloc for BumpAlloc {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let heap_base = unsafe { (*HEAP.0.get()).as_ptr() as usize };
-            loop {
-                let off = OFFSET.load(Ordering::Relaxed);
-                // Align the actual address, not just the offset
-                let addr = heap_base + off;
-                let aligned_addr = (addr + layout.align() - 1) & !(layout.align() - 1);
-                let aligned_off = aligned_addr - heap_base;
-                let new_off = aligned_off + layout.size();
-                if new_off > HEAP_SIZE {
-                    return core::ptr::null_mut();
-                }
-                if OFFSET
-                    .compare_exchange_weak(off, new_off, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return aligned_addr as *mut u8;
-                }
-            }
-        }
-        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-    }
-}
-
-#[global_allocator]
-static ALLOC: heap::BumpAlloc = heap::BumpAlloc;
+// Heap is provided by embclox_hal_x86 (linked_list_allocator).
+// We initialize it in kmain via embclox_hal_x86::heap::init(...).
 
 // Minimal PCI config space access via port I/O
 fn pci_config_read(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
@@ -289,6 +251,25 @@ impl DmaAllocator for LimineDmaAllocator {
     }
 }
 
+/// Default static network configuration when the cmdline doesn't specify
+/// `ip=`/`gw=`. Matches `scripts/hyperv-setup-vswitch.ps1`.
+const NET_DEFAULTS: embclox_hal_x86::cmdline::StaticDefaults =
+    embclox_hal_x86::cmdline::StaticDefaults {
+        ip: [192, 168, 234, 50],
+        prefix: 24,
+        gw: [192, 168, 234, 1],
+    };
+
+/// Read the Limine-provided kernel command line as a UTF-8 string slice.
+/// Returns "" when the bootloader didn't pass one.
+fn cmdline_str() -> &'static str {
+    if let Some(resp) = CMDLINE_REQUEST.get_response() {
+        resp.cmdline().to_str().unwrap_or("")
+    } else {
+        ""
+    }
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
     let mut serial = SerialPort::new(0x3F8);
@@ -298,6 +279,10 @@ unsafe extern "C" fn kmain() -> ! {
 
     assert!(BASE_REVISION.is_supported());
     writeln!(serial, "Limine base revision: supported").ok();
+
+    // Init the global Rust heap (linked_list_allocator from hal-x86).
+    // 4 MiB matches the previous Tulip-local bump allocator size.
+    embclox_hal_x86::heap::init(4 * 1024 * 1024);
 
     // Get HHDM offset
     let hhdm_offset = HHDM_REQUEST.get_response().map(|r| r.offset()).unwrap_or(0);
@@ -337,9 +322,12 @@ unsafe extern "C" fn kmain() -> ! {
     // Init DMA pool from Limine memory map (sub-4GB usable region)
     init_dma_pool();
 
-    // Calibrate TSC for embassy time driver
-    time::calibrate_tsc();
-    writeln!(serial, "TSC calibrated").ok();
+    // Calibrate TSC for embassy time driver. PIT works on QEMU and on
+    // Hyper-V Gen1; on hosts where it doesn't, fall back to a 1 GHz
+    // assumption (timing will be off but the kernel boots).
+    let tsc_per_us = embclox_hal_x86::pit::calibrate_tsc_mhz().unwrap_or(1000);
+    embclox_hal_x86::time::set_tsc_per_us(tsc_per_us);
+    writeln!(serial, "TSC calibrated: {} cycles/us", tsc_per_us).ok();
 
     // Scan PCI for Tulip NIC
     writeln!(serial, "Scanning PCI bus for Tulip NIC...").ok();
@@ -431,7 +419,33 @@ unsafe extern "C" fn kmain() -> ! {
     // --- Embassy networking ---
     let driver = crate::tulip_embassy::TulipEmbassy::new(device, mac);
 
-    let config = embassy_net::Config::dhcpv4(Default::default());
+    // Network mode is selected by Limine cmdline (see limine.conf).
+    // Default = DHCP for QEMU SLIRP CI; static option for Hyper-V testing.
+    let cmdline = cmdline_str();
+    writeln!(serial, "Tulip: cmdline = '{}'", cmdline).ok();
+    let net_mode = embclox_hal_x86::cmdline::parse_net_mode(cmdline, NET_DEFAULTS);
+    let config = match net_mode {
+        embclox_hal_x86::cmdline::NetMode::Dhcp => {
+            writeln!(serial, "Tulip: network mode = DHCPv4").ok();
+            embassy_net::Config::dhcpv4(Default::default())
+        }
+        embclox_hal_x86::cmdline::NetMode::Static { ip, prefix, gw } => {
+            writeln!(
+                serial,
+                "Tulip: network mode = static {}.{}.{}.{}/{} gw={}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3], prefix, gw[0], gw[1], gw[2], gw[3],
+            )
+            .ok();
+            embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+                address: embassy_net::Ipv4Cidr::new(
+                    embassy_net::Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]),
+                    prefix,
+                ),
+                gateway: Some(embassy_net::Ipv4Address::new(gw[0], gw[1], gw[2], gw[3])),
+                dns_servers: heapless::Vec::new(),
+            })
+        }
+    };
 
     static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
@@ -452,7 +466,7 @@ unsafe extern "C" fn kmain() -> ! {
     x86_64::instructions::interrupts::enable();
     loop {
         unsafe { executor.poll() };
-        time::check_alarms();
+        embclox_hal_x86::time::on_timer_tick();
         crate::tulip_embassy::TULIP_WAKER.wake();
         core::hint::spin_loop();
     }

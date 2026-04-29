@@ -1,12 +1,19 @@
 # scripts/hyperv-boot-test.ps1
 #
-# Hyper-V Gen1 boot + VMBus test for the Hyper-V example kernel.
+# Hyper-V Gen1 boot + VMBus + NetVSC TCP echo test for the Hyper-V
+# example kernel.
 #
 # Creates a Gen1 VM, attaches the ISO as a DVD, reads serial output
-# from COM1 named pipe, and checks for VMBus initialization.
+# from COM1 named pipe, attaches the VM to the dedicated `embclox-test`
+# Internal vSwitch, and probes TCP echo on port 1234.
 #
 # Prerequisites:
 #   - Hyper-V enabled (Windows feature)
+#   - Run scripts/hyperv-setup-vswitch.ps1 ONCE as Administrator to
+#     create the dedicated `embclox-test` Internal vSwitch
+#     (host = 192.168.234.1/24, VMs use 192.168.234.50/24).
+#     Without this the script will fall back to leaving the NIC
+#     unconnected, and TCP echo will be skipped.
 #   - Build the ISO first (from WSL or Linux):
 #       cmake -B build
 #       cmake --build build --target hyperv-image
@@ -16,17 +23,25 @@
 #   .\scripts\hyperv-boot-test.ps1
 #   .\scripts\hyperv-boot-test.ps1 -Elevate
 #   .\scripts\hyperv-boot-test.ps1 -Iso build\hyperv.iso
-#   .\scripts\hyperv-boot-test.ps1 -Iso build\hyperv.iso -TimeoutSeconds 120
+#   .\scripts\hyperv-boot-test.ps1 -SwitchName 'Default Switch'  # not recommended
 #
 # From WSL:
 #   powershell.exe -ExecutionPolicy Bypass -File scripts/hyperv-boot-test.ps1 -Iso build/hyperv.iso
+#
+# Why a dedicated Internal vSwitch instead of Default Switch:
+# Hyper-V's Default Switch (NAT/ICS) accumulates Permanent ARP entries
+# for every IP it has ever DHCP-leased, often for the entire /20 it
+# manages. Once it has bound 192.168.234.50 (or whatever IP) to a
+# stale VM MAC, no new VM can use that IP because ARP lookups from the
+# host return the wrong MAC and TCP times out. The dedicated Internal
+# vSwitch has no DHCP server, no Permanent ARP table, and is reset
+# every time you re-run hyperv-setup-vswitch.ps1.
 
 param(
     [string]$Iso = "build\hyperv.iso",
     [string]$VMName = "embclox-hyperv-test",
-    [int]$TimeoutSeconds = 120,
-    [string]$SwitchName = "Default Switch",
-    [string]$StaticVMIp = "172.19.192.50",
+    [int]$TimeoutSeconds = 90,
+    [string]$SwitchName = "embclox-test",
     [switch]$Elevate
 )
 
@@ -111,21 +126,6 @@ if ($SwitchName) {
         Write-Host "Network adapter connected to vSwitch: $SwitchName"
     } else {
         Write-Host "vSwitch '$SwitchName' not found - leaving NIC unconnected" -ForegroundColor Yellow
-    }
-}
-
-# Default Switch on Windows accumulates *Permanent* ARP entries from past
-# DHCP leases. Once an IP is bound to a (now-stale) MAC, gratuitous ARP
-# from the new VM cannot override it and TCP connects time out. Try to
-# remove any stale entry for our static VM IP. Best-effort: if the
-# current shell isn't elevated this silently no-ops.
-if ($StaticVMIp) {
-    try {
-        Get-NetNeighbor -InterfaceAlias "vEthernet ($SwitchName)" -IPAddress $StaticVMIp -ErrorAction SilentlyContinue |
-            Remove-NetNeighbor -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Host "Cleared any stale ARP entry for $StaticVMIp"
-    } catch {
-        Write-Host "Could not clear ARP for ${StaticVMIp}: $_" -ForegroundColor Yellow
     }
 }
 

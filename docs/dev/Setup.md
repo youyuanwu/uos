@@ -6,3 +6,6 @@ Get-LocalGroupMember -Group "Hyper-V Administrators"
 Start-VM "MyVM"
 Stop-VM "MyVM"
 ```
+
+For Hyper-V test networking (vSwitch setup, why we don't use Default
+Switch, ICS ARP pollution issue): see [HyperV-Testing.md](HyperV-Testing.md).
