@@ -70,7 +70,6 @@ All in `crates/embclox-hyperv/src/`:
 | `channel.rs::recv_with_timeout` | `wait_for_packet_async` + `block_on_hlt`; signature changed `spin_iters: u64` → `timeout: embassy_time::Duration` |
 | `netvsc.rs::recv_rndis_response` | `recv_rndis_response_async` + `block_on_hlt` (uses `embassy_futures::yield_now()` between `poll_channel` calls) |
 | `netvsc.rs::send_rndis_control` (section-free wait) | `wait_for_send_section_async` + `block_on_hlt` |
-| `netvsc.rs::transmit` (sync back-compat) | same `wait_for_send_section_async` |
 | `synthvid.rs::drain_recv` | short-deadline poll + `yield_now` under `block_on_hlt` |
 
 ### Sites intentionally NOT converted
@@ -122,6 +121,47 @@ message you actually wanted is a silent data loss bug.
 
 Discarded messages are logged at `trace!` so unexpected host traffic
 can be diagnosed without flooding success-path logs.
+
+#### Comparison to Linux
+
+Linux's `drivers/hv/{connection,channel_mgmt}.c` uses a different
+model:
+
+- The ISR (well, its deferred procedure `vmbus_on_msg_dpc`) drains
+  every SIMP message unconditionally and dispatches via a
+  per-msgtype table (`channel_message_table[CHANNELMSG_COUNT]`).
+- Request/response messages (`VERSION_RESPONSE`, `GPADL_CREATED`,
+  `OPENCHANNEL_RESULT`) walk a list of pending requests
+  (`vmbus_connection.chn_msg_list`) keyed by `(msgtype, child_relid,
+  gpadl_id, openid)`, then `complete()` the matching `waitevent`.
+  Waiters do `wait_for_completion(&msginfo->waitevent)` and sleep
+  until the ISR signals them.
+- If no waiter matches, the response is **silently dropped** (no
+  log, no warning) — the for_each_entry loop just doesn't find a
+  hit.
+- Unsolicited messages (`OFFERCHANNEL`, `RESCIND_CHANNELOFFER`,
+  `ALLOFFERS_DELIVERED`) have dedicated handlers that always run
+  regardless of waiter state.
+
+We achieve the same effect with much less code because we exploit
+two simplifications Linux can't make:
+
+1. **Single in-flight wait.** Linux supports many concurrent
+   requests across many channels; their list-walk and ID-keyed
+   matching is essential. We sequence init synchronously so there's
+   only ever one `wait_for_match` parked at a time. The matcher
+   closure replaces both the dispatch table and the list walk.
+2. **No background dispatch needed during init.** Linux's ISR runs
+   constantly, even when no one is waiting, because user-space
+   processes can connect to running channels at any time. Our boot
+   path runs to completion before any user code exists.
+
+Trade-off: we'd need to add a separate background dispatch loop if
+we ever wanted to handle unsolicited host events that arrive
+*outside* any pending wait — e.g. channel rescind during init. Our
+current matchers would silently discard those. Today none of the
+init steps care about such events; after init, the embassy executor
++ NETVSC_WAKER cover all asynchronous events on the data plane.
 
 ## Why not full embassy-executor for boot?
 

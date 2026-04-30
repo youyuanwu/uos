@@ -901,38 +901,6 @@ impl NetvscDevice {
         Ok(())
     }
 
-    // ── Back-compat wrappers (kept for existing tests / examples) ───
-
-    /// Transmit an Ethernet frame. Thin wrapper over [`Self::transmit_with`].
-    pub fn transmit(&mut self, frame: &[u8]) -> Result<(), HvError> {
-        // Mirror the original blocking behaviour for callers that haven't
-        // moved to the embassy waker pattern yet. Drives
-        // wait_for_send_section_async under block_on_hlt so the CPU
-        // sleeps between SINT2 IRQs instead of spinning.
-        if !self.has_tx_space() {
-            embclox_hal_x86::runtime::block_on_hlt(
-                self.wait_for_send_section_async(Duration::from_secs(2)),
-            )?;
-        }
-        self.transmit_with(frame.len(), |buf| buf.copy_from_slice(frame))
-    }
-
-    /// Try to receive an Ethernet frame. Thin wrapper over
-    /// [`Self::has_rx_packet`] + [`Self::recv_with`].
-    pub fn try_receive(&mut self, frame_buf: &mut [u8]) -> Result<Option<usize>, HvError> {
-        if !self.has_rx_packet() {
-            return Ok(None);
-        }
-        let n = self
-            .recv_with(|frame| {
-                let n = frame.len().min(frame_buf.len());
-                frame_buf[..n].copy_from_slice(&frame[..n]);
-                n
-            })
-            .unwrap_or(0);
-        Ok(Some(n))
-    }
-
     /// Send an RNDIS control message (non-mutable version for keepalive responses).
     fn send_rndis_control_inner(&self, rndis_msg: &[u8]) -> Result<(), HvError> {
         let dst = self.send_buf.vaddr as *mut u8;
