@@ -149,7 +149,27 @@ pub(crate) fn connect(
 }
 
 /// Try a single VMBus version: send INITIATE_CONTACT, poll for VERSION_RESPONSE.
+///
+/// Pre-Phase-2 spin-loop entrypoint. Now a thin sync wrapper around
+/// the async [`try_version_async`] driven by `block_on_hlt`. Caller
+/// must have installed the SINT2 ISR and started the APIC timer
+/// (see `embclox_hal_x86::runtime`).
 fn try_version(
+    hcall: &HypercallPage,
+    synic: &SynIC,
+    version: u32,
+    monitor1: &DmaRegion,
+    monitor2: &DmaRegion,
+) -> Result<(), HvError> {
+    embclox_hal_x86::runtime::block_on_hlt(try_version_async(
+        hcall, synic, version, monitor1, monitor2,
+    ))
+}
+
+/// Async core of [`try_version`]. Returns when VERSION_RESPONSE arrives
+/// or the 5-second deadline expires. Re-polls the SIMP on every IRQ
+/// (SINT2 = host-message-pending; APIC timer = deadline tick).
+async fn try_version_async(
     hcall: &HypercallPage,
     synic: &SynIC,
     version: u32,
@@ -179,33 +199,23 @@ fn try_version(
         msg_bytes,
     )?;
 
-    // Poll for VERSION_RESPONSE with timeout (~5 seconds at ~1GHz spin)
-    for _ in 0..5_000_000u64 {
-        if let Some(payload) = synic.poll_message() {
-            if payload.len() >= core::mem::size_of::<VmbusVersionResponse>() {
-                let resp = unsafe { &*(payload.as_ptr() as *const VmbusVersionResponse) };
+    let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_secs(5);
 
-                if resp.msgtype == CHANNELMSG_VERSION_RESPONSE {
-                    let supported = resp.version_supported != 0;
-                    synic.ack_message();
-
-                    if supported {
-                        return Ok(());
-                    } else {
-                        return Err(HvError::VersionRejected);
-                    }
-                }
-            }
-            // Not the message we expected — ack and continue polling
-            synic.ack_message();
+    crate::synic::wait_for_match(synic, deadline, |payload| {
+        if payload.len() < core::mem::size_of::<VmbusVersionResponse>() {
+            return None;
         }
-
-        for _ in 0..1000 {
-            core::hint::spin_loop();
+        let resp = unsafe { &*(payload.as_ptr() as *const VmbusVersionResponse) };
+        if resp.msgtype != CHANNELMSG_VERSION_RESPONSE {
+            return None;
         }
-    }
-
-    Err(HvError::Timeout)
+        Some(if resp.version_supported != 0 {
+            Ok(())
+        } else {
+            Err(HvError::VersionRejected)
+        })
+    })
+    .await?
 }
 
 /// Send REQUEST_OFFERS and collect all OFFERCHANNEL responses.
@@ -213,6 +223,13 @@ fn try_version(
 /// Returns a list of channel offers. The host sends one OFFERCHANNEL (type 1)
 /// per synthetic device, followed by ALLOFFERS_DELIVERED (type 4).
 pub(crate) fn request_offers(
+    hcall: &HypercallPage,
+    synic: &SynIC,
+) -> Result<Vec<ChannelOffer>, HvError> {
+    embclox_hal_x86::runtime::block_on_hlt(request_offers_async(hcall, synic))
+}
+
+async fn request_offers_async(
     hcall: &HypercallPage,
     synic: &SynIC,
 ) -> Result<Vec<ChannelOffer>, HvError> {
@@ -226,67 +243,65 @@ pub(crate) fn request_offers(
         msg_bytes,
     )?;
 
-    let mut offers = Vec::new();
+    let mut offers: Vec<ChannelOffer> = Vec::new();
+    let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_secs(10);
 
-    // Poll for offers with timeout
-    for _ in 0..10_000_000u64 {
-        if let Some(payload) = synic.poll_message() {
-            if payload.len() < 4 {
-                synic.ack_message();
-                continue;
-            }
-
-            let msgtype = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-
-            match msgtype {
-                CHANNELMSG_OFFERCHANNEL => {
-                    if let Some(offer) = parse_offer(payload) {
-                        info!(
-                            "VMBus offer: {} ({}) relid={} conn={}",
-                            device_name(&offer.device_type),
-                            offer.device_type,
-                            offer.child_relid,
-                            offer.connection_id
-                        );
-                        offers.push(offer);
-                    } else {
-                        warn!(
-                            "VMBus: failed to parse OFFERCHANNEL (len={})",
-                            payload.len()
-                        );
-                    }
-                    synic.ack_message();
-                }
-                CHANNELMSG_ALLOFFERS_DELIVERED => {
-                    synic.ack_message();
-                    info!("VMBus: all offers delivered ({} devices)", offers.len());
-                    return Ok(offers);
-                }
-                _ => {
-                    trace!(
-                        "VMBus: unexpected message type {} during offer collection",
-                        msgtype
+    let result = crate::synic::wait_for_match(synic, deadline, |payload| {
+        if payload.len() < 4 {
+            return None;
+        }
+        let msgtype = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        match msgtype {
+            CHANNELMSG_OFFERCHANNEL => {
+                if let Some(offer) = parse_offer(payload) {
+                    info!(
+                        "VMBus offer: {} ({}) relid={} conn={}",
+                        device_name(&offer.device_type),
+                        offer.device_type,
+                        offer.child_relid,
+                        offer.connection_id
                     );
-                    synic.ack_message();
+                    offers.push(offer);
+                } else {
+                    warn!(
+                        "VMBus: failed to parse OFFERCHANNEL (len={})",
+                        payload.len()
+                    );
                 }
+                None // keep waiting for more offers
+            }
+            CHANNELMSG_ALLOFFERS_DELIVERED => Some(()), // done
+            _ => {
+                trace!(
+                    "VMBus: unexpected message type {} during offer collection",
+                    msgtype
+                );
+                None // keep waiting (matcher gets these too; trace logs them)
             }
         }
+    })
+    .await;
 
-        for _ in 0..100 {
-            core::hint::spin_loop();
+    match result {
+        Ok(()) => {
+            info!("VMBus: all offers delivered ({} devices)", offers.len());
+            Ok(offers)
         }
+        Err(HvError::Timeout) => {
+            // If we got some offers but never saw ALLOFFERS_DELIVERED,
+            // return what we have (matches pre-async behaviour).
+            if !offers.is_empty() {
+                warn!(
+                    "VMBus: timeout waiting for ALLOFFERS_DELIVERED, returning {} offers",
+                    offers.len()
+                );
+                Ok(offers)
+            } else {
+                Err(HvError::Timeout)
+            }
+        }
+        Err(e) => Err(e),
     }
-
-    // If we got some offers but never saw ALLOFFERS_DELIVERED, return what we have
-    if !offers.is_empty() {
-        warn!(
-            "VMBus: timeout waiting for ALLOFFERS_DELIVERED, returning {} offers",
-            offers.len()
-        );
-        return Ok(offers);
-    }
-
-    Err(HvError::Timeout)
 }
 
 /// Parse an OFFERCHANNEL message payload into a ChannelOffer.

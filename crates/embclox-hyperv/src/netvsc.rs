@@ -19,6 +19,7 @@ use crate::nvsp_types::{
 use crate::HvError;
 use crate::VmBus;
 use embassy_sync::waitqueue::AtomicWaker;
+use embassy_time::{Duration, Instant};
 use embclox_dma::{DmaAllocator, DmaRegion};
 use embclox_hal_x86::memory::MemoryMapper;
 use log::*;
@@ -168,7 +169,7 @@ impl NetvscDevice {
         // Wait for SEND_RECV_BUF_COMPLETE (may arrive as completion type 11 with payload)
         let mut resp = [0u8; 256];
         let resp_len = loop {
-            let (desc, len) = channel.recv_with_timeout(&mut resp, 50_000_000)?;
+            let (desc, len) = channel.recv_with_timeout(&mut resp, Duration::from_secs(5))?;
             info!(
                 "NetVSC: buf_setup recv: type={} off8={} len8={} txid={} payload={}",
                 desc.packet_type, desc.offset8, desc.len8, desc.transaction_id, len
@@ -214,7 +215,7 @@ impl NetvscDevice {
 
         // Wait for SEND_SEND_BUF_COMPLETE (may arrive as completion type 11 with payload)
         let resp_len = loop {
-            let (_desc, len) = channel.recv_with_timeout(&mut resp, 5_000_000)?;
+            let (_desc, len) = channel.recv_with_timeout(&mut resp, Duration::from_secs(2))?;
             if len > 0 {
                 break len;
             }
@@ -262,14 +263,12 @@ impl NetvscDevice {
 
         dev.rndis_init()?;
 
-        // Drain TX completions and unsolicited messages before next control
-        for _ in 0..10_000_000u64 {
+        // Drain TX completions and unsolicited messages before next control.
+        // This is a synchronous "process anything pending right now" loop, not
+        // a wait — block_on_hlt isn't useful here. Bound the iteration count
+        // defensively in case the host is wedged producing junk.
+        for _ in 0..10_000u64 {
             if !dev.poll_channel()? {
-                // No more packets — wait a bit and try once more
-                for _ in 0..100_000 {
-                    core::hint::spin_loop();
-                }
-                dev.poll_channel()?;
                 break;
             }
         }
@@ -310,7 +309,7 @@ impl NetvscDevice {
             channel.send(&nvsp_message_padded(&msg), 0)?;
 
             let mut resp = [0u8; 256];
-            let (_desc, resp_len) = channel.recv_with_timeout(&mut resp, 5_000_000)?;
+            let (_desc, resp_len) = channel.recv_with_timeout(&mut resp, Duration::from_secs(2))?;
 
             if let Some(NvspResponse::InitComplete { status, .. }) =
                 parse_nvsp_response(&resp[..resp_len])
@@ -348,21 +347,11 @@ impl NetvscDevice {
                 0
             }
         );
-        // Wait for send buffer section 0 to be free
+        // Wait for send buffer section 0 to be free.
         if !self.send_section_free {
-            for _ in 0..50_000_000u64 {
-                self.poll_channel()?;
-                if self.send_section_free {
-                    break;
-                }
-                for _ in 0..100 {
-                    core::hint::spin_loop();
-                }
-            }
-            if !self.send_section_free {
-                error!("NetVSC: send section timeout");
-                return Err(HvError::Timeout);
-            }
+            embclox_hal_x86::runtime::block_on_hlt(
+                self.wait_for_send_section_async(Duration::from_secs(2)),
+            )?;
         }
 
         assert!(rndis_msg.len() <= NETVSC_SEND_BUF_SIZE);
@@ -493,10 +482,22 @@ impl NetvscDevice {
         Ok(())
     }
 
-    /// Wait for a RNDIS control response by polling the channel dispatch loop.
+    /// Wait for a RNDIS control response. Drives the async core under
+    /// `block_on_hlt` so the CPU sleeps between SINT2 IRQs.
     fn recv_rndis_response(&mut self, buf: &mut [u8]) -> Result<usize, HvError> {
         self.ctrl_resp_ready = false;
-        for i in 0..100_000_000u64 {
+        embclox_hal_x86::runtime::block_on_hlt(
+            self.recv_rndis_response_async(buf, Duration::from_secs(5)),
+        )
+    }
+
+    async fn recv_rndis_response_async(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize, HvError> {
+        let deadline = Instant::now() + timeout;
+        loop {
             self.poll_channel()?;
             if self.ctrl_resp_ready {
                 let len = self.ctrl_resp_len.min(buf.len());
@@ -504,18 +505,30 @@ impl NetvscDevice {
                 self.ctrl_resp_ready = false;
                 return Ok(len);
             }
-            if i > 0 && i % 10_000_000 == 0 {
-                info!(
-                    "NetVSC: waiting for RNDIS response... ({}M iterations)",
-                    i / 1_000_000
-                );
+            if Instant::now() >= deadline {
+                error!("NetVSC: RNDIS response timeout");
+                return Err(HvError::Timeout);
             }
-            for _ in 0..100 {
-                core::hint::spin_loop();
-            }
+            embassy_futures::yield_now().await;
         }
-        error!("NetVSC: RNDIS response timeout after 100M iterations");
-        Err(HvError::Timeout)
+    }
+
+    /// Wait until `send_section_free` becomes true (a TX completion packet
+    /// has freed up send buffer section 0). Drives `poll_channel` between
+    /// `await` points so block_on_hlt halts between SINT2 IRQs.
+    async fn wait_for_send_section_async(&mut self, timeout: Duration) -> Result<(), HvError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.poll_channel()?;
+            if self.send_section_free {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                error!("NetVSC: send section timeout");
+                return Err(HvError::Timeout);
+            }
+            embassy_futures::yield_now().await;
+        }
     }
 
     /// Parse a VM_PKT_DATA_USING_XFER_PAGES packet and copy RNDIS data from recv buffer.
@@ -893,21 +906,13 @@ impl NetvscDevice {
     /// Transmit an Ethernet frame. Thin wrapper over [`Self::transmit_with`].
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), HvError> {
         // Mirror the original blocking behaviour for callers that haven't
-        // moved to the embassy waker pattern yet: poll until TX space is
-        // available, bounded by the same spin budget as before.
+        // moved to the embassy waker pattern yet. Drives
+        // wait_for_send_section_async under block_on_hlt so the CPU
+        // sleeps between SINT2 IRQs instead of spinning.
         if !self.has_tx_space() {
-            for _ in 0..50_000_000u64 {
-                let _ = self.pump_channel();
-                if self.send_section_free {
-                    break;
-                }
-                for _ in 0..100 {
-                    core::hint::spin_loop();
-                }
-            }
-            if !self.send_section_free {
-                return Err(HvError::Timeout);
-            }
+            embclox_hal_x86::runtime::block_on_hlt(
+                self.wait_for_send_section_async(Duration::from_secs(2)),
+            )?;
         }
         self.transmit_with(frame.len(), |buf| buf.copy_from_slice(frame))
     }

@@ -199,17 +199,26 @@ impl SynthvidDevice {
     // --- Private protocol methods ---
 
     /// Drain pending messages from the recv ring.
+    ///
+    /// Spends up to ~10 ms allowing the host to deliver any in-flight
+    /// messages, then drains them. Driven by block_on_hlt so the CPU
+    /// sleeps between SINT2 IRQs.
     fn drain_recv(&self) {
         let mut buf = [0u8; 256];
-        for _ in 0..50 {
-            for _ in 0..50_000 {
-                core::hint::spin_loop();
+        let _ = embclox_hal_x86::runtime::block_on_hlt(async {
+            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(10);
+            loop {
+                // Drain anything visible right now.
+                while let Ok(Some(_)) = self.channel.try_recv(&mut buf) {
+                    // discard
+                }
+                if embassy_time::Instant::now() >= deadline {
+                    break;
+                }
+                embassy_futures::yield_now().await;
             }
-            match self.channel.try_recv(&mut buf) {
-                Ok(Some(_)) => {} // discard and continue
-                _ => break,
-            }
-        }
+            Ok::<(), HvError>(())
+        });
     }
 
     fn negotiate_version(&mut self) -> Result<(), HvError> {
@@ -231,7 +240,9 @@ impl SynthvidDevice {
 
             // Wait for VERSION_RESPONSE
             let mut buf = [0u8; 256];
-            let (_, rlen) = self.channel.recv_with_timeout(&mut buf, 5_000_000)?;
+            let (_, rlen) = self
+                .channel
+                .recv_with_timeout(&mut buf, embassy_time::Duration::from_secs(2))?;
 
             if rlen >= 22 {
                 // pipe_hdr(8) + vid_hdr(8) + version(4) + is_accepted(1) + max_outputs(1)
@@ -273,7 +284,9 @@ impl SynthvidDevice {
 
         // Wait for VRAM_LOCATION_ACK
         let mut buf = [0u8; 256];
-        let (_, rlen) = self.channel.recv_with_timeout(&mut buf, 5_000_000)?;
+        let (_, rlen) = self
+            .channel
+            .recv_with_timeout(&mut buf, embassy_time::Duration::from_secs(2))?;
 
         if rlen >= 16 {
             if let Some(vid_type) = parse_vid_type(&buf) {

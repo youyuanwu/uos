@@ -343,6 +343,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "embclox-async"
+version = "0.1.0"
+
+[[package]]
 name = "embclox-core"
 version = "0.1.0"
 dependencies = [
@@ -396,6 +400,7 @@ dependencies = [
  "critical-section",
  "embassy-executor",
  "embassy-time-driver",
+ "embclox-async",
  "linked_list_allocator",
  "log",
  "spin",
@@ -408,8 +413,11 @@ name = "embclox-hyperv"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "embassy-futures",
  "embassy-net-driver",
  "embassy-sync",
+ "embassy-time",
+ "embclox-async",
  "embclox-dma",
  "embclox-hal-x86",
  "log",

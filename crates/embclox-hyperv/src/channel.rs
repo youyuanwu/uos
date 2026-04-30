@@ -88,21 +88,45 @@ impl Channel {
         })
     }
 
-    /// Poll until a packet arrives or timeout.
+    /// Wait for a packet on this channel, up to `timeout`.
+    ///
+    /// Drives [`Self::wait_for_packet_async`] under
+    /// `embclox_hal_x86::runtime::block_on_hlt` so the CPU sleeps
+    /// between SINT2 IRQ wake-ups instead of spinning. Suitable for
+    /// boot-time control-plane RECVs (NVSP/RNDIS init responses).
+    ///
+    /// Caller must have already wired the SINT2 ISR + APIC timer
+    /// (the runtime helpers handle this; see
+    /// `examples-hyperv/src/main.rs` for the canonical setup order).
     pub fn recv_with_timeout(
         &self,
         buf: &mut [u8],
-        spin_iters: u64,
+        timeout: embassy_time::Duration,
     ) -> Result<(VmPacketDescriptor, usize), HvError> {
-        for _ in 0..spin_iters {
-            if let Some(result) = self.try_recv(buf)? {
-                return Ok(result);
-            }
-            for _ in 0..100 {
-                core::hint::spin_loop();
-            }
+        embclox_hal_x86::runtime::block_on_hlt(self.wait_for_packet_async(buf, timeout))
+    }
+
+    /// Async version of [`Self::recv_with_timeout`]: poll the channel
+    /// ring until [`Self::try_recv`] returns `Some`, or `timeout`
+    /// elapses.
+    ///
+    /// Unlike [`crate::synic::wait_for_match`], no payload is
+    /// "discarded" on no-match — there's no matcher; if a packet
+    /// arrives, it's returned to the caller as-is. The caller is
+    /// responsible for any further filtering or re-poll loops at the
+    /// protocol level (e.g. NVSP type discrimination).
+    pub async fn wait_for_packet_async(
+        &self,
+        buf: &mut [u8],
+        timeout: embassy_time::Duration,
+    ) -> Result<(VmPacketDescriptor, usize), HvError> {
+        let deadline = embassy_time::Instant::now() + timeout;
+        WaitForPacket {
+            channel: self,
+            buf,
+            deadline,
         }
-        Err(HvError::Timeout)
+        .await
     }
 
     /// Send a VMBus packet with a page buffer (GPA direct) for RNDIS control messages.
@@ -344,30 +368,29 @@ pub(crate) fn create_gpadl(
     }
 
     // Wait for GPADL_CREATED
-    for _ in 0..5_000_000u64 {
-        if let Some(payload) = synic.poll_message() {
-            if payload.len() >= 20 {
-                let msgtype = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-                if msgtype == CHANNELMSG_GPADL_CREATED {
-                    let status = u32::from_le_bytes(payload[16..20].try_into().unwrap());
-                    synic.ack_message();
-                    if status == 0 {
-                        info!("GPADL {} created successfully", gpadl_handle);
-                        return Ok(());
-                    } else {
-                        error!("GPADL creation failed: status {:#x}", status);
-                        return Err(HvError::HypercallFailed(status as u16));
-                    }
-                }
+    let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_secs(5);
+    let status = embclox_hal_x86::runtime::block_on_hlt(crate::synic::wait_for_match(
+        synic,
+        deadline,
+        |payload| {
+            if payload.len() < 20 {
+                return None;
             }
-            synic.ack_message();
-        }
-        for _ in 0..1000 {
-            core::hint::spin_loop();
-        }
-    }
+            let msgtype = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+            if msgtype != CHANNELMSG_GPADL_CREATED {
+                return None;
+            }
+            Some(u32::from_le_bytes(payload[16..20].try_into().unwrap()))
+        },
+    ))?;
 
-    Err(HvError::Timeout)
+    if status == 0 {
+        info!("GPADL {} created successfully", gpadl_handle);
+        Ok(())
+    } else {
+        error!("GPADL creation failed: status {:#x}", status);
+        Err(HvError::HypercallFailed(status as u16))
+    }
 }
 
 /// Send OPENCHANNEL and wait for OPENCHANNEL_RESULT.
@@ -406,28 +429,69 @@ fn open_channel_msg(
     )?;
 
     // Wait for OPENCHANNEL_RESULT
-    for _ in 0..5_000_000u64 {
-        if let Some(payload) = synic.poll_message() {
-            if payload.len() >= 20 {
-                let msgtype = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-                if msgtype == CHANNELMSG_OPENCHANNEL_RESULT {
-                    let status = u32::from_le_bytes(payload[16..20].try_into().unwrap());
-                    synic.ack_message();
-                    if status == 0 {
-                        info!("Channel {} opened successfully", child_relid);
-                        return Ok(());
-                    } else {
-                        error!("Channel open failed: status {:#x}", status);
-                        return Err(HvError::HypercallFailed(status as u16));
-                    }
+    let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_secs(5);
+    let status = embclox_hal_x86::runtime::block_on_hlt(crate::synic::wait_for_match(
+        synic,
+        deadline,
+        |payload| {
+            if payload.len() < 20 {
+                return None;
+            }
+            let msgtype = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+            if msgtype != CHANNELMSG_OPENCHANNEL_RESULT {
+                return None;
+            }
+            Some(u32::from_le_bytes(payload[16..20].try_into().unwrap()))
+        },
+    ))?;
+
+    if status == 0 {
+        info!("Channel {} opened successfully", child_relid);
+        Ok(())
+    } else {
+        error!("Channel open failed: status {:#x}", status);
+        Err(HvError::HypercallFailed(status as u16))
+    }
+}
+
+// ── Async helpers for boot-time channel ring polling under block_on_hlt ──
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/// Future that polls a [`Channel`]'s receive ring buffer until a packet
+/// arrives or `deadline` (from `embassy_time::Instant`) is reached.
+///
+/// Designed for boot-time control-plane RECVs (NVSP/RNDIS handshakes)
+/// driven by `embclox_hal_x86::runtime::block_on_hlt`. Caller has
+/// already wired the SINT2 ISR; the host raises SINT2 whenever it
+/// writes to the channel ring, which wakes `block_on_hlt` from `hlt`,
+/// which re-polls this future, which re-checks the ring.
+struct WaitForPacket<'a, 'b> {
+    channel: &'a Channel,
+    buf: &'b mut [u8],
+    deadline: embassy_time::Instant,
+}
+
+impl<'a, 'b> Future for WaitForPacket<'a, 'b> {
+    type Output = Result<(VmPacketDescriptor, usize), HvError>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: WaitForPacket holds two non-overlapping borrows
+        // (self.channel: &Channel, self.buf: &mut [u8]); we just need
+        // to project them out without moving the pinned future.
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.channel.try_recv(this.buf) {
+            Ok(Some(result)) => Poll::Ready(Ok(result)),
+            Ok(None) => {
+                if embassy_time::Instant::now() >= this.deadline {
+                    Poll::Ready(Err(HvError::Timeout))
+                } else {
+                    Poll::Pending
                 }
             }
-            synic.ack_message();
-        }
-        for _ in 0..1000 {
-            core::hint::spin_loop();
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
-
-    Err(HvError::Timeout)
 }

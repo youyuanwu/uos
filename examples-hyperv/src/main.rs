@@ -279,9 +279,8 @@ unsafe extern "C" fn kmain() -> ! {
     // --- Hyper-V VMBus initialization ---
 
     // Initialize the IDT + disable the legacy PIC before any handler
-    // registration. The runtime APIC timer (started inside run_embassy)
-    // and the SynIC SINT2 handler (registered just before run_embassy)
-    // both use the shared HAL IDT.
+    // registration. Both the runtime APIC timer (started below) and
+    // the SynIC SINT2 handler use the shared HAL IDT.
     embclox_hal_x86::idt::init();
     embclox_hal_x86::pic::disable();
 
@@ -301,6 +300,36 @@ unsafe extern "C" fn kmain() -> ! {
 
             // Construct MemoryMapper from Limine-provided offsets
             let mut memory = embclox_hal_x86::memory::MemoryMapper::new(hhdm_offset, kernel_offset);
+
+            // Calibrate the TSC and start the APIC periodic timer + register
+            // vmbus_isr BEFORE VMBus init runs. embclox_hyperv::init drives
+            // its synchronous boot phase via block_on_hlt internally; that
+            // runner needs (a) the SINT2 IRQ wired so host VMBus messages
+            // can wake the CPU from hlt, and (b) the APIC timer firing so
+            // the deadline-check on each iteration eventually fires even
+            // if the host never replies.
+            let tsc_per_us = read_hv_tsc_freq()
+                .or_else(embclox_hal_x86::pit::calibrate_tsc_mhz)
+                .unwrap_or(2400);
+            embclox_hal_x86::time::set_tsc_per_us(tsc_per_us);
+            writeln!(serial, "TSC calibrated: {} cycles/us", tsc_per_us).ok();
+
+            let lapic_vaddr = memory
+                .map_mmio(embclox_hal_x86::apic::LAPIC_PHYS_BASE, 0x1000)
+                .vaddr();
+            let mut lapic = embclox_hal_x86::apic::LocalApic::new(lapic_vaddr);
+            lapic.enable();
+            embclox_hal_x86::runtime::start_apic_timer(lapic, tsc_per_us, 1_000);
+
+            unsafe {
+                embclox_hal_x86::idt::set_handler(embclox_hyperv::msr::VMBUS_VECTOR, vmbus_isr);
+            }
+            writeln!(
+                serial,
+                "IDT installed (SINT2 vector {})",
+                embclox_hyperv::msr::VMBUS_VECTOR
+            )
+            .ok();
 
             match embclox_hyperv::init(&dma, &mut memory) {
                 Ok(mut vmbus) => {
@@ -343,24 +372,7 @@ unsafe extern "C" fn kmain() -> ! {
                                 netvsc.mtu(),
                             ).ok();
 
-                            // --- Phase 4a: install IDT + enable SynIC SINT2 ISR ---
-                            // Register vmbus_isr at the SynIC SINT2 vector via the
-                            // shared HAL IDT (the runtime module also installs the
-                            // APIC timer ISR there during run_embassy).
-                            unsafe {
-                                embclox_hal_x86::idt::set_handler(
-                                    embclox_hyperv::msr::VMBUS_VECTOR,
-                                    vmbus_isr,
-                                );
-                            }
-                            writeln!(
-                                serial,
-                                "IDT installed (SINT2 vector {})",
-                                embclox_hyperv::msr::VMBUS_VECTOR
-                            )
-                            .ok();
-
-                            // --- Phase 4b: hand the device to embassy and run ---
+                            // --- Phase 4: hand the device to embassy and run ---
                             //
                             // From this point on the kernel main thread is the
                             // embassy executor's hlt loop; it never returns.
@@ -432,33 +444,16 @@ fn cmdline_str() -> &'static str {
 /// runtime module) covers timer wakeups.
 fn run_embassy(
     mut netvsc: embclox_hyperv::netvsc::NetvscDevice,
-    mut memory: embclox_hal_x86::memory::MemoryMapper,
+    _memory: embclox_hal_x86::memory::MemoryMapper,
 ) -> ! {
     let mut serial = SerialPort::new(0x3F8);
 
     // Enable Debug to see VMBus packet activity in Azure debugging.
     log::set_max_level(log::LevelFilter::Debug);
 
-    // Calibrate the TSC. Prefer the Hyper-V TSC frequency MSR (exact);
-    // fall back to PIT calibration; final fallback is 2.4 GHz default.
-    let tsc_per_us = read_hv_tsc_freq()
-        .or_else(embclox_hal_x86::pit::calibrate_tsc_mhz)
-        .unwrap_or(2400);
-    embclox_hal_x86::time::set_tsc_per_us(tsc_per_us);
-    writeln!(serial, "PHASE4B: TSC calibrated: {} cycles/us", tsc_per_us).ok();
-
-    // Map LAPIC MMIO via the page tables. The Limine HHDM only covers
-    // as much physical RAM as the guest has, so the LAPIC MMIO page at
-    // 0xFEE0_0000 (~4 GiB physical) is not addressable through it on
-    // memory-constrained hosts. Use the MemoryMapper so we always get
-    // a valid uncached virtual mapping. MmioMapping has no Drop impl,
-    // so the page-table entry persists for the program lifetime.
-    let lapic_vaddr = memory
-        .map_mmio(embclox_hal_x86::apic::LAPIC_PHYS_BASE, 0x1000)
-        .vaddr();
-    let mut lapic = embclox_hal_x86::apic::LocalApic::new(lapic_vaddr);
-    lapic.enable();
-    embclox_hal_x86::runtime::start_apic_timer(lapic, tsc_per_us, 1_000);
+    // TSC calibration, LAPIC mapping, APIC timer, and SINT2 ISR
+    // registration all happened in kmain BEFORE embclox_hyperv::init —
+    // necessary so block_on_hlt could drive the VMBus init handshake.
 
     // Read the kernel cmdline that limine.conf passed (e.g. "net=dhcp"
     // for the DHCP boot menu entry; default = static).

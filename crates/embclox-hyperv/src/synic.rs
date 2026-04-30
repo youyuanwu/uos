@@ -114,3 +114,107 @@ impl SynIC {
         (self.simp.vaddr + offset) as *mut HvMessage
     }
 }
+
+// ── Async helpers for boot-time SIMP polling under block_on_hlt ──
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/// Future that polls the SIMP slot for a VMBus channel message and
+/// invokes `matcher` on each. `matcher` returns `Some(R)` to complete
+/// the future with `Ok(R)`, or `None` to ack and keep waiting for the
+/// next message. Returns `Err(HvError::Timeout)` if `deadline` (from
+/// `embassy_time::Instant`) is reached.
+///
+/// Designed to be driven by `embclox_hal_x86::runtime::block_on_hlt`
+/// during synchronous boot init, where the caller has already wired
+/// the SINT2 ISR so the host's message-arrival IRQ wakes the CPU
+/// from `hlt`.
+///
+/// # Important: matcher contract
+///
+/// Every message visible in the SIMP slot is passed to `matcher`
+/// **exactly once** and then **acked unconditionally** — including
+/// when `matcher` returns `None`. Acking clears the SIMP slot and
+/// (if `MessagePending` is set) signals `EOM` so the host delivers
+/// the next queued message; the discarded message is gone forever.
+///
+/// In practice this is safe because VMBus init is request/response
+/// sequenced — the host shouldn't send unrelated messages mid-step,
+/// and the SIMP only has one slot per SINT. But a `matcher` that
+/// expects to see *several* message types in one wait (e.g. the
+/// `request_offers` pattern of OFFERCHANNEL × N + ALLOFFERS_DELIVERED)
+/// must recognise every type it cares about: returning `None` for a
+/// message you actually wanted to keep is a silent data loss bug.
+///
+/// Discarded messages are logged at `trace!` level so unexpected
+/// messages can be diagnosed without flooding logs.
+pub fn wait_for_match<'a, F, R>(
+    synic: &'a SynIC,
+    deadline: embassy_time::Instant,
+    matcher: F,
+) -> WaitForMatch<'a, F>
+where
+    F: FnMut(&[u8]) -> Option<R>,
+{
+    WaitForMatch {
+        synic,
+        deadline,
+        matcher,
+    }
+}
+
+pub struct WaitForMatch<'a, F> {
+    synic: &'a SynIC,
+    deadline: embassy_time::Instant,
+    matcher: F,
+}
+
+impl<'a, F, R> Future for WaitForMatch<'a, F>
+where
+    F: FnMut(&[u8]) -> Option<R> + Unpin,
+{
+    type Output = Result<R, crate::HvError>;
+
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        // Drain whatever messages are visible right now. Each iteration
+        // either matches (return Ready), or doesn't match (ack + look
+        // for the next one). When the SIMP slot is empty, check the
+        // deadline and otherwise return Pending so block_on_hlt can
+        // park the CPU until the next IRQ.
+        loop {
+            let payload_opt = self.synic.poll_message();
+            match payload_opt {
+                Some(payload) => {
+                    let result = (self.matcher)(payload);
+                    if result.is_none() {
+                        // Discarded — log enough to diagnose unexpected
+                        // host traffic without spamming success paths.
+                        let msgtype = if payload.len() >= 4 {
+                            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+                        } else {
+                            0
+                        };
+                        log::trace!(
+                            "wait_for_match: discarding SIMP message type={} len={}",
+                            msgtype,
+                            payload.len()
+                        );
+                    }
+                    self.synic.ack_message();
+                    if let Some(r) = result {
+                        return Poll::Ready(Ok(r));
+                    }
+                    // No match — loop and look for the next message.
+                }
+                None => {
+                    if embassy_time::Instant::now() >= self.deadline {
+                        return Poll::Ready(Err(crate::HvError::Timeout));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}

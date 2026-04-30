@@ -7,6 +7,7 @@ members = [
     "examples-hyperv",
     "examples-tulip",
     "qemu-tests/unit",
+    "crates/embclox-async",
     "crates/embclox-core",
     "crates/embclox-dma",
     "crates/embclox-e1000",
@@ -18,6 +19,7 @@ members = [
 
 default-members = [
     "tools/embclox-mkimage",
+    "crates/embclox-async",
     "crates/embclox-core",
     "crates/embclox-dma",
     "crates/embclox-e1000",
@@ -39,6 +41,7 @@ embassy-futures = "0.1"
 embedded-io-async = "0.7"
 
 # Drivers & platform
+embclox-async = { path = "crates/embclox-async" }
 embclox-dma = { path = "crates/embclox-dma" }
 embclox-hyperv = { path = "crates/embclox-hyperv" }
 embclox-tulip = { path = "crates/embclox-tulip" }

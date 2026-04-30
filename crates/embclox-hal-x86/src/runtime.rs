@@ -127,3 +127,40 @@ pub fn run_executor(executor: &'static Executor) -> ! {
         x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
+
+// ── block_on_hlt: one-future runner with idle sleep ────────────
+
+pub use embclox_async::block_on_with;
+
+/// Run a single future to completion, halting the CPU between polls.
+///
+/// Thin wrapper over [`embclox_async::block_on_with`] that supplies an
+/// x86 `sti; hlt` park function. Suitable for synchronous boot phases
+/// where you want a real `Future` API but cannot run the full embassy
+/// executor yet.
+///
+/// # Caller contract
+///
+/// - Some interrupt source must be able to fire to break the CPU out
+///   of `hlt` — typically the APIC periodic timer started by
+///   [`start_apic_timer`] plus the device-specific IRQs the future
+///   polls for (e.g. SynIC SINT2 for VMBus).
+/// - The future itself must not call `hlt` or any other blocking
+///   primitive — it must return [`core::task::Poll::Pending`] when not
+///   ready and let `block_on_hlt` perform the halt.
+///
+/// # Example
+///
+/// ```ignore
+/// // After idt::init + lapic.enable + start_apic_timer:
+/// let result: Result<NetvscDevice, HvError> =
+///     embclox_hal_x86::runtime::block_on_hlt(async {
+///         init_vmbus_async(&dma, &mut memory).await
+///     });
+/// ```
+pub fn block_on_hlt<F: core::future::Future>(fut: F) -> F::Output {
+    block_on_with(fut, || {
+        x86_64::instructions::interrupts::disable();
+        x86_64::instructions::interrupts::enable_and_hlt();
+    })
+}
